@@ -48,6 +48,8 @@ class PlatformBase:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        # 最近一次 DDC 读是否成功。读失败时上层不应据此改角色（见 agent._refresh_platform_cache）
+        self.last_read_ok = True
 
     def target_display_present(self) -> bool:
         raise NotImplementedError
@@ -193,9 +195,18 @@ class MacPlatform(PlatformBase):
     def current_input(self) -> int | None:
         rc, out, err = self._run(self.get_cmd.format(index=self.display_index))
         if rc != 0:
+            self.last_read_ok = False
             return None
-        m = re.search(r"\b(\d+)\b", out)
-        return int(m.group(1)) if m else None
+        # m1ddc 用**负数**表示失败（刚切完输入源的那几秒会返回 -7）。
+        # 原来的 \b(\d+)\b 会把 "-7" 里的 7 抠出来当成一个合法的输入源编号，
+        # 于是状态里会出现"当前输入源 0x07"这种根本不存在的值。
+        m = re.search(r"(-?\d+)", out)
+        if not m:
+            self.last_read_ok = False
+            return None
+        v = int(m.group(1))
+        self.last_read_ok = v >= 0
+        return v if v >= 0 else None
 
     def _on_this_machine(self, cur: int | None) -> bool:
         """只有当前输入源恰好是本机那个口时，画面才真的在本机。
@@ -226,8 +237,12 @@ class MacPlatform(PlatformBase):
     def can_switch_directly(self) -> bool:
         # Apple Silicon 的 DDC 代理：显示器显示对端时本机照样能下发 set input。
         # （已在 HKC H27T22C3 + MacBook Air 上实测：显示器正在显示 Windows 时，
-        #  Mac 下发 set input 15 能直接把画面切回来。）
-        return self.current_input() is not None
+        #  Mac 下发 set input 15 能直接把画面切回来，rc=0。）
+        #
+        # 注意这里**不能**用"读没读到"来判断：刚切完输入源的那几秒 DDC 读必然
+        # 失败（返回 -7），但写照样能成功。用读的结果会把这期间的自动切换
+        # 误判成"通道断了"，进而退回去委托一个并不存在的对端。
+        return True
 
     def switch_to(self, source: int) -> bool:
         rc, out, err = self._run(

@@ -146,7 +146,8 @@ python agent.py --config kvm.json
 
 ```bash
 python kvmctl.py status
-python kvmctl.py switch
+python kvmctl.py switch        # 切到本机
+python kvmctl.py switch-peer   # 切到对端
 ```
 
 看日志里打的是 `[dry-run] 本应把输入源切到 0xXX` —— 逻辑对了。
@@ -310,6 +311,7 @@ launchctl load ~/Library/LaunchAgents/cn.displaykvm.agent.plist
 ```bash
 python kvmctl.py status        # 看状态
 python kvmctl.py switch        # 立即把显示器切到本机
+python kvmctl.py switch-peer   # 立即把显示器切到对端（把画面交出去）
 python kvmctl.py auto off      # 暂停自动，只保留手动
 python kvmctl.py auto on       # 恢复自动
 ```
@@ -317,6 +319,7 @@ python kvmctl.py auto on       # 恢复自动
 如果 agent 改过 `control_port`，加 `--port 47824`。
 
 想绑热键，就让热键去执行 `python kvmctl.py switch` 即可。  
+也可以绑两条：`switch` 拉过来，`switch-peer` 交出去。
 Windows 上可以用 AutoHotkey，macOS 上可以用快捷指令或 skhd。
 
 ---

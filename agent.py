@@ -74,6 +74,9 @@ DEFAULT_CONFIG: dict = {
     "fire_below_idle_seconds": 0.45,
     "cooldown_seconds": 6.0,
     "hello_interval_seconds": 3.0,
+    # 超过这么久没收到对端的任何消息，就判定对端离线并清掉它的地址。
+    # 否则对端下线后托盘会一直显示它最后一次的 IP 和角色（v1.0.0 的行为）。
+    "peer_timeout_seconds": 12.0,
 }
 
 
@@ -115,6 +118,8 @@ class Agent:
         self.armed = False
         self.peer_ip = cfg.get("peer_ip") or ""
         self.peer_role = "unknown"
+        self.peer_last_seen = 0.0  # 收到对端消息的时间戳，0 = 从没收到过
+        self.peer_online = False
         self.last_switch_ts = 0.0
         self.auto_on = bool(cfg["auto_switch"])
         self.running = True
@@ -165,11 +170,15 @@ class Agent:
             log("忽略来自 %s 的消息：token 不匹配" % addr[0])
             return
 
+        # 任何一条合法消息都算一次心跳（hello / switch_request / ack 都算）
+        self.peer_last_seen = time.time()
+        if not self.peer_online or self.peer_ip != addr[0]:
+            log("发现对端 %s（%s）" % (msg.get("from"), addr[0]))
+        self.peer_online = True
+
         kind = msg.get("t")
 
         if kind == "hello":
-            if self.peer_ip != addr[0]:
-                log("发现对端 %s（%s）" % (msg.get("from"), addr[0]))
             self.peer_ip = addr[0]
             self.peer_role = msg.get("role", "unknown")
             if not self.cfg.get("peer_ip"):
@@ -255,6 +264,60 @@ class Agent:
         self.last_switch_ts = now
         return "delegated"
 
+    def request_switch_peer(self, reason: str, force: bool = False) -> str:
+        """请求把显示器切到**对端**（把画面交出去）。
+
+        v1.0.0 只实现了"切到本机"：所有切换路径写的都是 my_src，peer_src
+        从头到尾只出现在状态显示里。结果是任何一端都只能把画面拉给自己，
+        没有任何办法主动把画面交给对方 —— 想切过去只能去碰对方那台机器的键鼠。
+
+        执行者只能是"当前正在显示"或"能直接写 DDC"的那一端：
+          - 本机正在显示                    -> 本机写 peer_src，画面直接交出去
+          - 本机不在显示、但能直写（Apple Silicon 的 Mac）-> 同样本地写
+          - 两条都不满足（如 Windows 且不在显示）-> 委托对端，让它切到我的 peer_src
+        """
+        now = time.time()
+        if not force and now - self.last_switch_ts < self.cfg["cooldown_seconds"]:
+            return "cooldown"
+
+        with self._plat_lock:
+            direct = self.role == "active" or self.platform.can_switch_directly()
+
+        if direct:
+            self._perform_switch(self.peer_src, "%s｜把画面交给对端" % reason)
+            return "local"
+
+        if not self.peer_ip:
+            log("%s｜但还没发现对端，无法委托" % reason)
+            return "no-peer"
+
+        # 委托时带的是"目标输入源"，也就是对端的口（= 我的 peer_src）
+        self._send_peer({"t": "switch_request", "source": self.peer_src})
+        log("%s｜已委托 %s 把显示器切到 0x%02X" % (reason, self.cfg["peer_name"], self.peer_src))
+        self.last_switch_ts = now
+        return "delegated"
+
+    def _expire_peer(self, now: float) -> None:
+        """对端心跳超时就判定离线并清掉地址。
+
+        v1.0.0 里 peer_ip / peer_role 一旦被赋值就永不失效：对端下线后，
+        托盘仍显示它最后一次的 IP 和角色，看着像"还连着"，其实早就断了。
+        """
+        if not self.peer_last_seen:
+            return
+        if now - self.peer_last_seen <= float(self.cfg["peer_timeout_seconds"]):
+            return
+        if self.peer_online:
+            log(
+                "对端 %s 已 %.0f 秒没有心跳，判定离线"
+                % (self.peer_ip or "?", now - self.peer_last_seen)
+            )
+        self.peer_online = False
+        if not self.cfg.get("peer_ip"):
+            # 只有自动发现出来的地址才清掉；配置里写死的要保留
+            self.peer_ip = ""
+        self.peer_role = "unknown"
+
     def _execute(self, op: dict) -> None:
         kind = op.get("kind")
         try:
@@ -269,6 +332,9 @@ class Agent:
 
             elif kind == "manual_switch":
                 op["result"] = self.request_switch(op.get("reason") or "手动触发", force=True)
+
+            elif kind == "manual_switch_peer":
+                op["result"] = self.request_switch_peer(op.get("reason") or "手动触发", force=True)
         except Exception as exc:  # noqa: BLE001
             log("执行任务出错: %s" % exc)
             op["result"] = "error"
@@ -313,6 +379,14 @@ class Agent:
         if cost > 1.0:
             log("警告：探测显示器耗时 %.1f 秒，偏慢" % cost)
 
+        # 读不到输入源时不要改角色：切换完的头几秒 DDC 读必然失败
+        #（m1ddc 返回 -7），这时把角色翻成 idle 会让自动切换误判，
+        # 甚至在本机刚拿到画面的情况下又立刻反向切一次。
+        if not getattr(self.platform, "last_read_ok", True):
+            self.cached_detail = "%s（输入源读取失败，角色保持 %s）" % (detail, self.role)
+            self.cached_idle = idle
+            return
+
         new_role = "active" if present else "idle"
         if new_role != self.role:
             log("角色变更：%s -> %s" % (self.role, new_role))
@@ -341,6 +415,8 @@ class Agent:
                 self._send_hello()
                 next_hello = now + float(self.cfg["hello_interval_seconds"])
 
+            self._expire_peer(now)
+
             if self.auto_on:
                 try:
                     self._tick_auto()
@@ -363,6 +439,8 @@ class Agent:
             "dry_run": bool(self.cfg["dry_run"]),
             "peer_ip": self.peer_ip,
             "peer_role": self.peer_role,
+            "peer_online": self.peer_online,
+            "peer_age_seconds": (time.time() - self.peer_last_seen) if self.peer_last_seen else None,
             "my_input_source": "0x%02X" % self.my_src,
             "peer_input_source": "0x%02X" % self.peer_src,
         }
@@ -375,6 +453,13 @@ class Agent:
         if line == "switch":
             ev = threading.Event()
             op = {"kind": "manual_switch", "reason": "手动触发", "event": ev}
+            self.ops.put(op)
+            ev.wait(3.0)
+            return {"ok": True, "action": op.get("result", "pending")}
+
+        if line in ("switch-peer", "switch peer", "switchpeer"):
+            ev = threading.Event()
+            op = {"kind": "manual_switch_peer", "reason": "手动触发（切到对端）", "event": ev}
             self.ops.put(op)
             ev.wait(3.0)
             return {"ok": True, "action": op.get("result", "pending")}
@@ -436,6 +521,14 @@ class Agent:
         """请求切换，线程安全：走任务队列交给主循环执行。"""
         ev = threading.Event()
         op = {"kind": "manual_switch", "reason": reason, "event": ev}
+        self.ops.put(op)
+        ev.wait(6.0)
+        return op.get("result", "pending")
+
+    def api_switch_peer(self, reason: str = "手动触发") -> str:
+        """请求把显示器切到对端，线程安全：走任务队列交给主循环执行。"""
+        ev = threading.Event()
+        op = {"kind": "manual_switch_peer", "reason": reason, "event": ev}
         self.ops.put(op)
         ev.wait(6.0)
         return op.get("result", "pending")

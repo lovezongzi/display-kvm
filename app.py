@@ -406,7 +406,18 @@ def run_tray(agent, cfg: dict) -> int:
     import pystray
     from pystray import Menu, MenuItem
 
-    state = {"role": "", "detail": "", "peer": "", "auto": agent.auto_on}
+    # 注意：Menu(...) 构造时就会调用 line_* 这些回调取文本，此时 refresh() 还没跑过。
+    # 所以这里必须把回调会读到的键全部初始化，否则第一次取文本就 KeyError
+    # —— 在打包后的 app 里这会表现为启动即 SIGABRT（刷新 stdout 失败 -> 致命错误）。
+    state = {
+        "role": "",
+        "detail": "",
+        "peer": "",
+        "peer_online": False,
+        "peer_role": "unknown",
+        "peer_age": None,
+        "auto": agent.auto_on,
+    }
 
     def refresh() -> None:
         try:
@@ -414,6 +425,9 @@ def run_tray(agent, cfg: dict) -> int:
             state["role"] = r.get("role", "")
             state["detail"] = r.get("detail", "")
             state["peer"] = r.get("peer_ip") or "未发现"
+            state["peer_online"] = bool(r.get("peer_online"))
+            state["peer_role"] = r.get("peer_role") or "unknown"
+            state["peer_age"] = r.get("peer_age_seconds")
             state["auto"] = bool(r.get("auto"))
         except Exception as exc:  # noqa: BLE001
             state["detail"] = "状态读取失败: %s" % exc
@@ -428,12 +442,36 @@ def run_tray(agent, cfg: dict) -> int:
         return (state["detail"] or "…")[:64]
 
     def line_peer(item=None) -> str:
-        return "对端 %s" % state["peer"]
+        # 对端下线后必须说清楚。原来只要曾经发现过就一直显示 IP + 旧角色，
+        # 看起来像"还连着"，实际上早就断了（v1.0.0 里 peer_ip 永不失效）。
+        if state.get("peer_online"):
+            return "对端 %s · %s · %.0fs 前心跳" % (
+                state.get("peer"),
+                state.get("peer_role"),
+                state.get("peer_age") or 0,
+            )
+        age = state.get("peer_age")
+        if age is None:
+            return "对端 未发现（从未收到心跳）"
+        return "对端 离线（%s，%.0fs 前失去心跳）" % (state.get("peer"), age)
 
     def do_switch(icon, item):
         r = agent.api_switch("托盘手动切换")
         msg = {
             "local": "本机直接切换已下发",
+            "delegated": "已委托对端切换",
+            "no-peer": "还没发现对端，无法切换",
+            "cooldown": "冷却中，请稍候",
+            "pending": "已提交，稍后生效",
+        }.get(r, r)
+        _notify(icon, APP_TITLE, msg)
+        refresh()
+        icon.update_menu()
+
+    def do_switch_peer(icon, item):
+        r = agent.api_switch_peer("托盘手动切换")
+        msg = {
+            "local": "已把画面交给对端",
             "delegated": "已委托对端切换",
             "no-peer": "还没发现对端，无法切换",
             "cooldown": "冷却中，请稍候",
@@ -476,6 +514,7 @@ def run_tray(agent, cfg: dict) -> int:
         MenuItem(line_peer, None, enabled=False),
         Menu.SEPARATOR,
         MenuItem("立即切到本机", do_switch),
+        MenuItem("立即切到对端（%s）" % (cfg.get("peer_name") or "对端"), do_switch_peer),
         MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
         Menu.SEPARATOR,
         MenuItem("打开配置文件", open_cfg),

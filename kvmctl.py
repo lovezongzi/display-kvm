@@ -7,6 +7,7 @@ Alfred / 快捷指令 / AutoHotkey 上，实现一键切换。
 用法：
     python kvmctl.py status        查看当前状态
     python kvmctl.py switch        立即把显示器切到本机
+    python kvmctl.py switch-peer   立即把显示器切到对端（把画面交出去）
     python kvmctl.py auto off      暂停自动切换
     python kvmctl.py auto on       恢复自动切换
     python kvmctl.py --port 47824 status
@@ -39,7 +40,11 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="display-kvm 控制客户端")
     ap.add_argument("--port", type=int, default=47822, help="agent 的本地控制端口")
     ap.add_argument("--json", action="store_true", help="输出原始 JSON")
-    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="status | switch | auto on | auto off | quit")
+    ap.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help="status | switch | switch-peer | auto on | auto off | quit",
+    )
     args = ap.parse_args(argv)
 
     cmd = " ".join(args.cmd).strip() or "status"
@@ -64,7 +69,17 @@ def main(argv: list[str]) -> int:
         print("键鼠空闲    : %s" % ("%.1f 秒" % idle if isinstance(idle, (int, float)) else "未知"))
         print("自动切换    : %s%s" % ("开" if st.get("auto") else "关", "（已就绪，等待本机键鼠活动）" if st.get("armed") else ""))
         print("DRY-RUN     : %s" % ("是" if st.get("dry_run") else "否"))
-        print("对端        : %s  角色=%s" % (st.get("peer_ip") or "尚未发现", st.get("peer_role")))
+        if st.get("peer_online"):
+            peer = "%s  角色=%s  %.0fs 前心跳" % (
+                st.get("peer_ip"),
+                st.get("peer_role"),
+                st.get("peer_age_seconds") or 0,
+            )
+        elif st.get("peer_age_seconds") is None:
+            peer = "尚未发现（从未收到心跳）"
+        else:
+            peer = "离线（%s，%.0fs 前失去心跳）" % (st.get("peer_ip") or "?", st.get("peer_age_seconds"))
+        print("对端        : %s" % peer)
         print("输入源      : 本机 %s / 对端 %s" % (st.get("my_input_source"), st.get("peer_input_source")))
     else:
         print("已执行：%s" % json.dumps(resp, ensure_ascii=False))
