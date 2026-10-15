@@ -8,6 +8,7 @@ Alfred / 快捷指令 / AutoHotkey 上，实现一键切换。
     python kvmctl.py status        查看当前状态
     python kvmctl.py switch        立即把显示器切到本机
     python kvmctl.py switch-peer   立即把显示器切到对端（把画面交出去）
+    python kvmctl.py autodetect    自动探测本机接在哪个输入口上
     python kvmctl.py auto off      暂停自动切换
     python kvmctl.py auto on       恢复自动切换
     python kvmctl.py --port 47824 status
@@ -43,7 +44,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
-        help="status | switch | switch-peer | auto on | auto off | quit",
+        help="status | switch | switch-peer | autodetect | auto on | auto off | quit",
     )
     args = ap.parse_args(argv)
 
@@ -80,7 +81,13 @@ def main(argv: list[str]) -> int:
         else:
             peer = "离线（%s，%.0fs 前失去心跳）" % (st.get("peer_ip") or "?", st.get("peer_age_seconds"))
         print("对端        : %s" % peer)
-        print("输入源      : 本机 %s / 对端 %s" % (st.get("my_input_source"), st.get("peer_input_source")))
+        print(
+            "输入源      : 本机 %s / 对端 %s"
+            % (
+                st.get("my_input_source_name") or st.get("my_input_source"),
+                st.get("peer_input_source_name") or st.get("peer_input_source"),
+            )
+        )
     else:
         print("已执行：%s" % json.dumps(resp, ensure_ascii=False))
 

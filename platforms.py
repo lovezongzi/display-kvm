@@ -20,11 +20,40 @@ import ctypes
 import re
 import subprocess
 import sys
+import time
 from ctypes import wintypes
 from pathlib import Path
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
+
+# DDC/CI 的 VCP 0x60（Input Select）取值含义。
+# 0x01~0x12 是 MCCS 标准；0x1B 是 m1ddc 文档里点名的 USB-C；
+# 0x90/0x91/0xD0/0xD1/0xD2 是 LG 一类显示器用的 alternate addressing
+#（m1ddc 的 input-alt 子命令走的那一套）。
+VCP_INPUT_NAMES = {
+    0x01: "VGA-1", 0x02: "VGA-2",
+    0x03: "DVI-1", 0x04: "DVI-2",
+    0x05: "Composite-1", 0x06: "Composite-2",
+    0x07: "S-Video-1", 0x08: "S-Video-2",
+    0x09: "Tuner-1", 0x0A: "Tuner-2", 0x0B: "Tuner-3",
+    0x0C: "Component-1", 0x0D: "Component-2", 0x0E: "Component-3",
+    0x0F: "DisplayPort-1", 0x10: "DisplayPort-2",
+    0x11: "HDMI-1", 0x12: "HDMI-2",
+    0x1B: "USB-C",
+    0x90: "HDMI-1(alt)", 0x91: "HDMI-2(alt)",
+    0xD0: "DisplayPort-1(alt)", 0xD1: "DisplayPort-2(alt)", 0xD2: "USB-C/DP-3(alt)",
+}
+
+
+def input_source_name(v: int | None) -> str:
+    """把 VCP 0x60 的取值翻译成人能看懂的输入口名字。
+
+    托盘和日志都用它，免得满屏 0x0F 这种要查表才知道是哪个口的东西。
+    """
+    if v is None:
+        return "未知"
+    return "%s（0x%02X）" % (VCP_INPUT_NAMES.get(v, "未知口"), v)
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -50,6 +79,9 @@ class PlatformBase:
         self.cfg = cfg
         # 最近一次 DDC 读是否成功。读失败时上层不应据此改角色（见 agent._refresh_platform_cache）
         self.last_read_ok = True
+        # 本机/对端各自接在哪个输入口，两端都要用（角色判定就是拿它和当前输入源比）
+        self.my_src = _parse_source(cfg.get("my_input_source"))
+        self.peer_src = _parse_source(cfg.get("peer_input_source"))
 
     def target_display_present(self) -> bool:
         raise NotImplementedError
@@ -122,15 +154,25 @@ class WindowsPlatform(PlatformBase):
         return None
 
     def target_display_present(self) -> bool:
-        return self._find_target() is not None
+        # 和 macOS 一样：光"显示器在列表里、DDC 读得到"不能说明它在显示我，
+        # 必须拿当前输入源和本机那个口比。否则 Windows 端角色永远是 active，
+        # 自动切换永远不会触发（v1.0.0 到现在的 Windows 侧行为）。
+        d = self._find_target()
+        return d is not None and d.current_input == self.my_src
 
     def probe(self) -> tuple[bool, str, float | None]:
         d = self._find_target()
         if d is None:
-            detail = "共用显示器当前不在本机（DDC 通道不可用）"
-        else:
-            detail = "共用显示器在本机，当前输入源 0x%02X" % d.current_input
-        return d is not None, detail, self.idle_seconds()
+            return False, "共用显示器当前不在本机（DDC 通道不可用）", self.idle_seconds()
+        cur = d.current_input
+        if cur == self.my_src:
+            detail = "共用显示器在本机，当前输入源 %s" % input_source_name(cur)
+            return True, detail, self.idle_seconds()
+        detail = "共用显示器在对端，当前输入源 %s（本机是 %s）" % (
+            input_source_name(cur),
+            input_source_name(self.my_src),
+        )
+        return False, detail, self.idle_seconds()
 
     def current_input(self) -> int | None:
         d = self._find_target()
@@ -226,13 +268,46 @@ class MacPlatform(PlatformBase):
         if cur is None:
             detail = "共用显示器当前不在本机（DDC 命令无返回）"
         elif present:
-            detail = "共用显示器在本机，当前输入源 0x%02X" % cur
+            detail = "共用显示器在本机，当前输入源 %s" % input_source_name(cur)
         else:
-            detail = "共用显示器在对端，当前输入源 0x%02X（本机是 0x%02X）" % (
-                cur,
-                self.my_src if self.my_src is not None else 0,
+            detail = "共用显示器在对端，当前输入源 %s（本机是 %s）" % (
+                input_source_name(cur),
+                input_source_name(self.my_src),
             )
         return present, detail, self.idle_seconds()
+
+    def probe_live_inputs(self, candidates, settle_seconds: float = 14.0) -> list[int]:
+        """逐个把显示器切到候选输入源，找出哪些口上真的接着一台开着的机器。
+
+        原理：写到一个空口上，显示器会自己跳回有信号的口。所以
+        「下发 X，过一会儿读回来还是 X」= X 上有活信号。
+
+        坑：这个"跳回"很慢。H27T22C3 实测切到空口后要 **12 秒**才跳回，
+        3 秒就去读的话会把空口全判成有信号（实测四个口全中）。所以
+        settle_seconds 默认给 14 秒，宁可慢也不能判错。
+
+        注意：这个过程会真的切换画面，所以只在用户主动触发时跑，
+        结束时会把显示器切回探测前的那个口。
+        """
+        original = self.current_input()
+        live: list[int] = []
+        for v in candidates:
+            if not self.switch_to(v):
+                continue
+            time.sleep(settle_seconds)
+            cur = self.current_input()
+            # 刚切完那几秒 DDC 读经常返回 -7（读失败），直接判定会把有信号的
+            # 口误判成空口。多读几次，读到有效值再下结论。
+            for _ in range(4):
+                if cur is not None:
+                    break
+                time.sleep(1.0)
+                cur = self.current_input()
+            if cur == v:
+                live.append(v)
+        if original is not None:
+            self.switch_to(original)
+        return live
 
     def can_switch_directly(self) -> bool:
         # Apple Silicon 的 DDC 代理：显示器显示对端时本机照样能下发 set input。

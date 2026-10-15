@@ -77,6 +77,11 @@ DEFAULT_CONFIG: dict = {
     # 超过这么久没收到对端的任何消息，就判定对端离线并清掉它的地址。
     # 否则对端下线后托盘会一直显示它最后一次的 IP 和角色（v1.0.0 的行为）。
     "peer_timeout_seconds": 12.0,
+    # 自动探测时逐个试的输入源（十进制）。15/16/17/18 是 m1ddc 文档里的
+    # DisplayPort 1/2、HDMI 1/2，27 是 USB-C。
+    "input_candidates": [15, 16, 17, 18, 27],
+    # 靠对端判断"现在显示的是谁"时，给它多久上报角色
+    "peer_settle_seconds": 6.0,
 }
 
 
@@ -121,6 +126,13 @@ class Agent:
         self.peer_last_seen = 0.0  # 收到对端消息的时间戳，0 = 从没收到过
         self.peer_online = False
         self.last_switch_ts = 0.0
+
+        # 由外壳（app.py）注入：配置落盘路径 + 需要人工确认时的提问回调
+        self.cfg_path: str | None = None
+        self.ask_user = None
+        # 探测输入源期间置 True：此时画面会来回切，必须让自动切换闭嘴，
+        # 否则它看到"角色变了 + 本机有活动"就会把画面抢回去，和探测打架。
+        self.probing = False
         self.auto_on = bool(cfg["auto_switch"])
         self.running = True
 
@@ -354,6 +366,8 @@ class Agent:
     # ------------------------------------------------------------------ 主循环
 
     def _tick_auto(self) -> None:
+        if self.probing:
+            return  # 正在探测输入源，别来抢画面
         idle = self.cached_idle
         if idle is None:
             return
@@ -443,6 +457,8 @@ class Agent:
             "peer_age_seconds": (time.time() - self.peer_last_seen) if self.peer_last_seen else None,
             "my_input_source": "0x%02X" % self.my_src,
             "peer_input_source": "0x%02X" % self.peer_src,
+            "my_input_source_name": platforms.input_source_name(self.my_src),
+            "peer_input_source_name": platforms.input_source_name(self.peer_src),
         }
 
     def _handle_command(self, line: str) -> dict:
@@ -463,6 +479,10 @@ class Agent:
             self.ops.put(op)
             ev.wait(3.0)
             return {"ok": True, "action": op.get("result", "pending")}
+
+        if line == "autodetect":
+            self.autodetect_async()
+            return {"ok": True, "action": "started"}
 
         if line == "auto on":
             self.auto_on = True
@@ -524,6 +544,130 @@ class Agent:
         self.ops.put(op)
         ev.wait(6.0)
         return op.get("result", "pending")
+
+    # ------------------------------------------------------------ 输入源自动探测
+
+    def autodetect_async(self) -> None:
+        """后台跑一次输入源自动探测（会真的切画面，不能在主循环里跑）。"""
+        threading.Thread(target=self._autodetect_worker, name="autodetect", daemon=True).start()
+
+    def _autodetect_worker(self) -> None:
+        """判断本机到底接在显示器的哪个输入口上。
+
+        难点：显示器只知道"哪个口有信号"，不知道这个信号属于哪台机器 ——
+        DDC 没有反向通道，纯软件推断做不到可靠。实测过"空口会不会自动跳回"
+        这条思路：这块 H27T22C3 要 12 秒才跳回，等 3 秒去读会把空口全判成
+        有信号（四个口全中），等 14 秒虽然准但一轮要一分多钟。
+
+        所以主流程改成**问一句**，而且给三个选项（本机 / 另一台 / 无信号）：
+          1. 先问当前正在显示的那个口 —— 多数人是在用本机时点的探测，
+             于是一次问答就完事，连画面都不用切；
+          2. 答"不是本机"就切到下一个候选再问，直到确认。
+        只有在没有交互手段时（headless），才退回慢速的活口探测。
+        """
+        name = platforms.input_source_name
+        self.probing = True
+        try:
+            if self.cfg["dry_run"]:
+                log("DRY-RUN 模式下无法探测 —— 探测依赖真的把画面切过去看反应")
+                return
+
+            cands = [
+                int(x, 0) if isinstance(x, str) else int(x)
+                for x in (self.cfg.get("input_candidates") or [15, 16, 17, 18, 27])
+            ]
+            with self._plat_lock:
+                cur = self.platform.current_input()
+            log("当前输入源 %s，开始确认哪个口是本机 ..." % name(cur))
+
+            my = None
+            peer = None
+
+            if callable(self.ask_user):
+                # 先问当前正在显示的这个口：多数人是在用本机的时候点探测，
+                # 于是一次问答就结束，连画面都不用切。
+                order = ([cur] if cur is not None else []) + [v for v in cands if v != cur]
+                for idx, v in enumerate(order):
+                    if idx > 0:
+                        log("切到 %s 再看 ..." % name(v))
+                        with self._plat_lock:
+                            self.platform.switch_to(v)
+                        time.sleep(3.0)
+                    ans = self.ask_user(v)
+                    if ans == "mac":
+                        my = v
+                        break
+                    if ans == "peer" and peer is None:
+                        peer = v
+                        log("记下 %s 是对端的口" % name(v))
+                if my is None:
+                    log("所有候选输入口都确认不是本机，配置保持原样")
+                    return
+
+            elif hasattr(self.platform, "probe_live_inputs"):
+                # 没有交互手段（headless）：退回"切过去看会不会自动跳回"的办法。
+                # 空口要十几秒才跳回（H27T22C3 实测 12 秒），settle 必须给足，
+                # 否则会把空口当成有信号 —— 实测 3 秒时四个口全被判成活的。
+                with self._plat_lock:
+                    live = self.platform.probe_live_inputs(cands, settle_seconds=14.0)
+                log("有信号的输入口：%s" % ("、".join(name(v) for v in live) or "一个都没有"))
+                if len(live) == 1:
+                    my = live[0]
+                elif len(live) >= 2 and self.peer_online:
+                    v = live[0]
+                    with self._plat_lock:
+                        self.platform.switch_to(v)
+                    log("已切到 %s，等对端上报它是否正在被显示 ..." % name(v))
+                    time.sleep(float(self.cfg.get("peer_settle_seconds", 6.0)))
+                    if self.peer_role == "active":
+                        peer, my = v, next((x for x in live if x != v), None)
+                        log("对端报告它在被显示 -> %s 是对端的口" % name(v))
+                    else:
+                        my, peer = v, next((x for x in live if x != v), None)
+                        log("对端没有在显示 -> %s 是本机的口" % name(v))
+                else:
+                    log("有 %d 个口有信号，无交互模式下判断不了哪个是本机" % len(live))
+                    return
+
+            else:
+                log(
+                    "当前平台既没有交互提问手段、也不支持活口探测（目前只有 macOS 实现了），"
+                    "无法自动识别本机输入口，请手动填 my_input_source。"
+                )
+                return
+
+            self.my_src = my
+            self.cfg["my_input_source"] = "0x%02X" % my
+            if peer is not None:
+                self.peer_src = peer
+                self.cfg["peer_input_source"] = "0x%02X" % peer
+
+            # 探完把画面交回本机，顺便让角色重新判定一次
+            with self._plat_lock:
+                self.platform.switch_to(my)
+            self.last_switch_ts = time.time()
+            self._save_cfg()
+            log(
+                "自动探测完成：本机 = %s，对端 = %s"
+                % (name(my), name(peer) if peer is not None else "未确定")
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("自动探测出错: %s" % exc)
+        finally:
+            self.probing = False
+
+    def _save_cfg(self) -> None:
+        """把改动后的配置写回磁盘（只有外壳给了 cfg_path 才写得成）。"""
+        if not self.cfg_path:
+            return
+        try:
+            from pathlib import Path
+
+            p = Path(self.cfg_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            log("配置写回失败: %s" % exc)
 
     def api_switch_peer(self, reason: str = "手动触发") -> str:
         """请求把显示器切到对端，线程安全：走任务队列交给主循环执行。"""

@@ -312,9 +312,17 @@ launchctl load ~/Library/LaunchAgents/cn.displaykvm.agent.plist
 python kvmctl.py status        # 看状态
 python kvmctl.py switch        # 立即把显示器切到本机
 python kvmctl.py switch-peer   # 立即把显示器切到对端（把画面交出去）
+python kvmctl.py autodetect    # 自动探测本机接在哪个输入口上
 python kvmctl.py auto off      # 暂停自动，只保留手动
 python kvmctl.py auto on       # 恢复自动
 ```
+
+`autodetect` 会弹一个三选一的对话框（本机 / 另一台 / 无信号）请你确认，
+这不是偷懒：DDC 里显示器只知道自己哪个口上有信号，并不知道那个信号属于哪台
+机器 —— 没有反向通道可问。实测过"切到空口看它会不会自动跳回"这条路：
+空口要 12 秒才跳回，等 3 秒去读会把空口全判成有信号（四个口全中），
+等够 14 秒虽然准，但一轮要一分多钟。所以问一句最快也最准，
+而且通常一次就完事（当前显示的正好是本机时，连画面都不用切）。
 
 如果 agent 改过 `control_port`，加 `--port 47824`。
 

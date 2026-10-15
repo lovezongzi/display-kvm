@@ -362,6 +362,88 @@ def _popup(msg: str) -> None:
         pass
 
 
+def _ask_yes_no(msg: str, yes: str = "是", no: str = "不是") -> bool:
+    """弹一个二选一的对话框，返回用户是不是点了「是」。
+
+    _popup 只会弹通知、拿不到结果；自动探测在无法自己判断"哪个口是本机"
+    的时候，需要真的问一句。
+    """
+    try:
+        if IS_WIN:
+            import ctypes
+
+            # MB_YESNO = 0x04，IDYES = 6
+            return ctypes.windll.user32.MessageBoxW(None, msg, APP_TITLE, 0x04) == 6
+        if IS_MAC:
+            safe = msg.replace('"', "'").replace("\n", " ")
+            p = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'display dialog "%s" buttons {"%s","%s"} default button 1' % (safe, yes, no),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            return yes in (p.stdout or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _ask_choice(msg: str, buttons: list[str]) -> str:
+    """弹一个多选一的对话框，返回被点的那个按钮文字。"""
+    try:
+        if IS_WIN:
+            import ctypes
+
+            # 三个选项够用：MB_YESNOCANCEL
+            r = ctypes.windll.user32.MessageBoxW(None, msg, APP_TITLE, 0x03)
+            return {6: buttons[0], 7: buttons[1]}.get(r, buttons[2] if len(buttons) > 2 else "")
+        if IS_MAC:
+            safe = msg.replace('"', "'").replace("\n", " ")
+            joined = ",".join('"%s"' % b for b in buttons)
+            p = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'display dialog "%s" buttons {%s} default button 1' % (safe, joined),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            out = p.stdout or ""
+            for b in buttons:
+                if ("button returned:%s" % b) in out:
+                    return b
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def make_ask_user():
+    """给 agent 用的提问回调：这个输入口上现在显示的是什么？
+
+    返回 "mac" / "peer" / "none"。三选一而不是"是不是本机"，是因为空口会
+    显示"无信号" —— 只给两个选项的话，"无信号"会被误记成对端的口。
+    """
+
+    def _ask(v: int) -> str:
+        try:
+            import platforms
+
+            label = platforms.input_source_name(v)
+        except Exception:  # noqa: BLE001
+            label = "0x%02X" % v
+        buttons = ["本机 Mac", "另一台机器", "无信号"]
+        ans = _ask_choice("显示器现在显示的是什么？\n\n当前输入源：%s" % label, buttons)
+        return {"本机 Mac": "mac", "另一台机器": "peer"}.get(ans, "none")
+
+    return _ask
+
+
 def already_running(port: int) -> bool:
     try:
         s = socket.create_connection(("127.0.0.1", int(port)), timeout=0.6)
@@ -481,6 +563,10 @@ def run_tray(agent, cfg: dict) -> int:
         refresh()
         icon.update_menu()
 
+    def do_autodetect(icon, item):
+        _notify(icon, APP_TITLE, "开始探测输入口，画面会切换几次")
+        agent.autodetect_async()
+
     def toggle_auto(icon, item):
         agent.auto_on = not agent.auto_on
         _notify(icon, APP_TITLE, "自动切换已%s" % ("开启" if agent.auto_on else "关闭"))
@@ -515,6 +601,7 @@ def run_tray(agent, cfg: dict) -> int:
         Menu.SEPARATOR,
         MenuItem("立即切到本机", do_switch),
         MenuItem("立即切到对端（%s）" % (cfg.get("peer_name") or "对端"), do_switch_peer),
+        MenuItem("自动探测本机输入口", do_autodetect),
         MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
         Menu.SEPARATOR,
         MenuItem("打开配置文件", open_cfg),
@@ -652,6 +739,9 @@ def main(argv: list[str] | None = None) -> int:
     ns = build_agent_namespace(args)
     ns.config = str(cfg_path)
     ag = agent_mod.Agent(cfg, ns)
+    # 让 agent 能把自动探测的结果写回配置，并在判断不了的时候弹窗问一句
+    ag.cfg_path = str(cfg_path)
+    ag.ask_user = make_ask_user()
 
     if args.headless:
         ag.run()
