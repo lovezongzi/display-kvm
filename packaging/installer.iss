@@ -3,11 +3,11 @@
 ;   bash packaging/build_win.sh              # 一键：装环境 -> 打 exe -> 打安装包
 ; 或只编译安装包（需已装 Inno Setup 6）：
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
-; 产物：dist\installer\Display-KVM-Setup-1.0.0.exe
+; 产物：dist\installer\Display-KVM-Setup-1.0.1.exe
 
 #define MyAppName "Display KVM"
 #define MyAppNameCn "显示器输入源自动切换"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppExeName "display-kvm.exe"
 #define MyAppCtlName "display-kvm-ctl.exe"
 

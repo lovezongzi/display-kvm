@@ -73,8 +73,8 @@ app = BUNDLE(
         "CFBundleName": "Display KVM",
         "CFBundleDisplayName": "Display KVM",
         "CFBundleIdentifier": "cn.displaykvm.agent",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": "1.0.1",
+        "CFBundleVersion": "1.0.1",
         "NSHighResolutionCapable": True,
         # 菜单栏应用：不占 Dock、不弹窗口
         "LSUIElement": True,
