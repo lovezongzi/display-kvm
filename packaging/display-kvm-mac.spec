@@ -20,6 +20,7 @@ if m1ddc.exists():
 
 hiddenimports = [
     "platforms",
+    "hotkeys",
     "pystray._darwin",
     # app.py 里是函数内懒加载，PyInstaller 扫不到
     "PyObjCTools.AppHelper",

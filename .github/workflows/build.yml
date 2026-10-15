@@ -1,0 +1,95 @@
+name: 构建发布产物
+
+# 为什么需要这个 workflow：
+# PyInstaller 不能交叉编译 —— dmg 必须在 macOS 上打，exe 必须在 Windows 上打。
+# 本机只有一边时，靠这里补上另一边。推 tag（v*）会自动把两边产物挂到 release。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # release 上传需要
+
+jobs:
+  build-macos:
+    name: macOS（dmg）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # m1ddc 没有官方预编译产物，官方安装方式是 brew install m1ddc。
+      # CI 上直接拉源码 make —— 它是 Objective-C + CoreDisplay，clang 就能编，
+      # 比装 Homebrew 快得多，也不依赖 runner 上有没有 bottle。
+      - name: 编译 m1ddc
+        run: |
+          curl -sL -o /tmp/m1ddc.zip https://codeload.github.com/waydabber/m1ddc/zip/refs/tags/v1.2.0
+          unzip -q -o /tmp/m1ddc.zip -d /tmp
+          make -C /tmp/m1ddc-1.2.0
+          install -m 0755 /tmp/m1ddc-1.2.0/m1ddc packaging/m1ddc
+          ./packaging/m1ddc display list || true
+
+      - name: 构建 app 与 dmg
+        run: bash packaging/build_mac.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: display-kvm-macos
+          path: dist/*.dmg
+
+  build-windows:
+    name: Windows（exe + 安装包）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # runner 一般自带 Inno Setup 6；没带就用 choco 补一个。
+      # 装不上就只出 exe，build_win.sh 内部已经处理了这种情况。
+      - name: 准备 Inno Setup
+        shell: pwsh
+        run: |
+          $p = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (Test-Path $p) { Write-Host "已自带 Inno Setup"; exit 0 }
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::Inno Setup 安装失败，将只产出 exe" }
+
+      - name: 构建 exe 与安装包
+        shell: bash
+        run: bash packaging/build_win.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: display-kvm-windows
+          path: |
+            dist/display-kvm.exe
+            dist/display-kvm-ctl.exe
+            dist/installer/*.exe
+
+  release:
+    name: 挂到 release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 整理产物
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name "*.dmg" -o -name "*.exe" \) -exec cp {} out/ \;
+          ls -la out/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

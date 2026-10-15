@@ -41,6 +41,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import hotkeys  # noqa: E402  放在 sys.path 之后，保证打包后也能找到
+
 
 # ---------------------------------------------------------------------- 路径
 
@@ -423,6 +425,53 @@ def _ask_choice(msg: str, buttons: list[str]) -> str:
     return ""
 
 
+def _ask_text(prompt: str, default: str = "") -> str | None:
+    """弹一个输入框。返回用户输入的文字；取消或失败返回 None。
+
+    Windows 没有原生 InputBox API，走 PowerShell 的 VisualBasic.Interaction。
+    """
+    try:
+        if IS_WIN:
+            ps = (
+                "Add-Type -AssemblyName Microsoft.VisualBasic; "
+                "[Microsoft.VisualBasic.Interaction]::InputBox(\"%s\", \"%s\", \"%s\")"
+                % (prompt.replace('"', "'").replace("\n", " "), APP_TITLE, default)
+            )
+            p = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            return (p.stdout or "").strip() or None
+        if IS_MAC:
+            import re
+
+            safe = prompt.replace('"', "'").replace("\n", " ")
+            dflt = default.replace('"', "'")
+            p = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'display dialog "%s" default answer "%s" '
+                    'buttons {"取消","确定"} default button 2' % (safe, dflt),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            out = p.stdout or ""
+            if "button returned:确定" not in out:
+                return None
+            m = re.search(r"text returned:(.*)$", out.strip())
+            return (m.group(1) if m else "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def make_ask_user():
     """给 agent 用的提问回调：这个输入口上现在显示的是什么？
 
@@ -444,6 +493,30 @@ def make_ask_user():
     return _ask
 
 
+_hk_popup_shown = False
+
+
+def _popup_once(msg: str) -> None:
+    """同一条提示只弹一次（快捷键没权限这种，每次启动都弹会很烦）。"""
+    global _hk_popup_shown
+    if _hk_popup_shown:
+        return
+    _hk_popup_shown = True
+    threading.Thread(target=_popup, args=(msg,), name="popup", daemon=True).start()
+
+
+def _save_cfg_fields(pairs: dict) -> bool:
+    """把若干字段写回 kvm.json（保留其它字段原样）。"""
+    try:
+        c = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+        c.update(pairs)
+        CONFIG_PATH.write_text(json.dumps(c, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print("[配置] 写回失败: %s" % exc, flush=True)
+        return False
+
+
 def already_running(port: int) -> bool:
     try:
         s = socket.create_connection(("127.0.0.1", int(port)), timeout=0.6)
@@ -462,25 +535,51 @@ def _warn_if_placeholder(cfg: dict) -> None:
 # ---------------------------------------------------------------------- 托盘
 
 
-def _tray_image():
+# 角色 -> 状态色。绿=显示器正在显示本机，红=在对端，灰=还没探明。
+ROLE_COLOR = {
+    "active": (46, 204, 113, 255),    # 绿
+    "idle": (231, 76, 60, 255),       # 红
+}
+ROLE_NEUTRAL = (140, 145, 155, 255)   # 灰
+
+
+def _tray_image(role: str = ""):
+    """托盘图标。右下角叠一个状态圆点，颜色跟着角色走。
+
+    注意：macOS 菜单栏可能把图标当 template 渲染成纯黑白，所以颜色不能只靠
+    图标 —— 菜单文本里也带了彩色圆点 emoji（见 role_label），两边都上色。
+    """
     from PIL import Image, ImageDraw
 
     bundled = resource_path("assets/icon.png")
+    img = None
     if bundled.exists():
         try:
-            return Image.open(bundled).convert("RGBA")
+            img = Image.open(bundled).convert("RGBA")
         except Exception:  # noqa: BLE001
-            pass
+            img = None
 
-    # 兜底：现场画一个
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    if img is None:
+        # 兜底：现场画一个
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([1, 1, size - 2, size - 2], radius=14, fill=(22, 26, 35, 255))
+        d.rounded_rectangle([7, 18, 26, 42], radius=3, fill=(77, 155, 255, 255))
+        d.rounded_rectangle([38, 18, 57, 42], radius=3, fill=(54, 200, 96, 255))
+        d.line([(28, 26), (36, 26)], fill=(232, 238, 248, 255), width=2)
+        d.line([(36, 36), (28, 36)], fill=(232, 238, 248, 255), width=2)
+    else:
+        img = img.copy()
+        if img.size[0] < 32:
+            img = img.resize((64, 64), Image.LANCZOS)
+
+    w, h = img.size
+    r = max(8, w // 4)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([1, 1, size - 2, size - 2], radius=14, fill=(22, 26, 35, 255))
-    d.rounded_rectangle([7, 18, 26, 42], radius=3, fill=(77, 155, 255, 255))
-    d.rounded_rectangle([38, 18, 57, 42], radius=3, fill=(54, 200, 96, 255))
-    d.line([(28, 26), (36, 26)], fill=(232, 238, 248, 255), width=2)
-    d.line([(36, 36), (28, 36)], fill=(232, 238, 248, 255), width=2)
+    # 先描一圈深色边，让圆点在浅色/深色菜单栏上都分得清
+    d.ellipse([w - r - 3, h - r - 3, w - 1, h - 1], fill=(18, 20, 26, 255))
+    d.ellipse([w - r, h - r, w - 4, h - 4], fill=ROLE_COLOR.get(role, ROLE_NEUTRAL))
     return img
 
 
@@ -515,7 +614,13 @@ def run_tray(agent, cfg: dict) -> int:
             state["detail"] = "状态读取失败: %s" % exc
 
     def role_label(role: str) -> str:
-        return {"active": "● 正在显示本机", "idle": "○ 不在本机"}.get(role, role or "…")
+        # 彩色圆点 emoji。菜单栏图标可能被系统当 template 渲染成黑白
+        # （见 _tray_image 的注释），但菜单文本里的 emoji 一定是彩色的，
+        # 所以颜色靠这里保证，图标那边只是锦上添花。
+        return {
+            "active": "🟢 正在显示本机",
+            "idle": "🔴 不在本机（对端占用）",
+        }.get(role, "⚪ %s" % (role or "…"))
 
     def line_status(item=None) -> str:
         return "%s · %s" % (agent.name, role_label(state["role"]))
@@ -567,6 +672,105 @@ def run_tray(agent, cfg: dict) -> int:
         _notify(icon, APP_TITLE, "开始探测输入口，画面会切换几次")
         agent.autodetect_async()
 
+    # ---------------------------------------------------------- 全局快捷键
+    HK = hotkeys.HotkeyManager()
+    HK_FIELD = {"to_me": "hotkey_to_me", "to_peer": "hotkey_to_peer"}
+    HK_TITLE = {
+        "to_me": "切到本机",
+        "to_peer": "切到对端（%s）" % (cfg.get("peer_name") or "对端"),
+    }
+
+    def hk_label(kind: str) -> str:
+        raw = (cfg.get(HK_FIELD[kind]) or "").strip()
+        if not raw:
+            return "未设置"
+        c = hotkeys.parse_combo(raw)
+        if c.is_empty():
+            return "%s ?" % raw
+        if not c.mods:
+            return "%s（缺修饰键）" % raw
+        return str(c)
+
+    def _hk_fire(kind: str) -> None:
+        """热键回调。必须挪到独立线程：api_switch 最多会等 6 秒，而 CGEventTap
+        的回调卡太久会被系统判定超时、把 tap 直接禁用掉。"""
+
+        def go():
+            try:
+                if kind == "to_me":
+                    agent.api_switch("快捷键触发")
+                else:
+                    agent.api_switch_peer("快捷键触发")
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=go, name="hk-fire", daemon=True).start()
+
+    def rebind_hotkeys() -> None:
+        # 同一个 HotkeyManager 的 bindings 是后台线程每帧重新读的，所以换绑定
+        # 只要 clear + bind 就生效，不用（也没法）重启那个线程。
+        HK.clear()
+        if cfg.get("hotkeys_enabled", True):
+            HK.bind(cfg.get("hotkey_to_me"), lambda: _hk_fire("to_me"))
+            HK.bind(cfg.get("hotkey_to_peer"), lambda: _hk_fire("to_peer"))
+        if HK.count() and not HK.active():
+            if HK.start():
+                print(
+                    "[快捷键] 已启用: %s"
+                    % "、".join(str(c) for c, _ in HK.bindings()),
+                    flush=True,
+                )
+            else:
+                print("[快捷键] 启用失败：%s" % (HK.error or "未知原因"), flush=True)
+                # 打包后看不到 stdout，权限缺失必须弹出来，否则用户只会觉得"没反应"
+                _popup_once(HK.error)
+        else:
+            print(
+                "[快捷键] 未启用（enabled=%s me=%r peer=%r 绑定=%d 线程存活=%s）"
+                % (
+                    cfg.get("hotkeys_enabled", True),
+                    cfg.get("hotkey_to_me"),
+                    cfg.get("hotkey_to_peer"),
+                    HK.count(),
+                    HK.active(),
+                ),
+                flush=True,
+            )
+
+    def set_hotkey(icon, kind) -> None:
+        cur = (cfg.get(HK_FIELD[kind]) or "").strip()
+        ans = _ask_text(
+            "给「%s」设一个全局快捷键。\n\n"
+            "写法：修饰键 + 主键，例如 ctrl+alt+1\n"
+            "修饰键：ctrl（Mac 上是 ⌃）/ alt（⌥）/ shift（⇧）/ cmd（⌘）\n"
+            "主键：字母、数字、f1~f20、方向键、space 等\n\n"
+            "留空 = 取消这个快捷键。" % HK_TITLE[kind],
+            cur,
+        )
+        if ans is None:
+            return  # 点了取消
+        ans = ans.strip()
+        if ans:
+            ok, note = hotkeys.validate_combo(ans)
+            if not ok:
+                _notify(icon, APP_TITLE, note)
+                return
+            ans = hotkeys.parse_combo(ans).to_config()
+        cfg[HK_FIELD[kind]] = ans
+        _save_cfg_fields({HK_FIELD[kind]: ans})
+        rebind_hotkeys()
+        _notify(icon, APP_TITLE, "「%s」：%s" % (HK_TITLE[kind], hk_label(kind)))
+        refresh()
+        icon.update_menu()
+
+    def toggle_hotkeys(icon, item) -> None:
+        cfg["hotkeys_enabled"] = not cfg.get("hotkeys_enabled", True)
+        _save_cfg_fields({"hotkeys_enabled": cfg["hotkeys_enabled"]})
+        rebind_hotkeys()
+        _notify(icon, APP_TITLE, "全局快捷键已%s" % ("开启" if cfg["hotkeys_enabled"] else "关闭"))
+        refresh()
+        icon.update_menu()
+
     def toggle_auto(icon, item):
         agent.auto_on = not agent.auto_on
         _notify(icon, APP_TITLE, "自动切换已%s" % ("开启" if agent.auto_on else "关闭"))
@@ -604,6 +808,16 @@ def run_tray(agent, cfg: dict) -> int:
         MenuItem("自动探测本机输入口", do_autodetect),
         MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
         Menu.SEPARATOR,
+        MenuItem(
+            lambda item: "快捷键 · %s：%s" % (HK_TITLE["to_me"], hk_label("to_me")),
+            lambda icon, item: set_hotkey(icon, "to_me"),
+        ),
+        MenuItem(
+            lambda item: "快捷键 · %s：%s" % (HK_TITLE["to_peer"], hk_label("to_peer")),
+            lambda icon, item: set_hotkey(icon, "to_peer"),
+        ),
+        MenuItem("启用快捷键", toggle_hotkeys, checked=lambda item: cfg.get("hotkeys_enabled", True)),
+        Menu.SEPARATOR,
         MenuItem("打开配置文件", open_cfg),
         MenuItem("打开日志", open_log),
         MenuItem("开机自启", toggle_startup, checked=lambda item: is_autostart_enabled()),
@@ -634,11 +848,15 @@ def run_tray(agent, cfg: dict) -> int:
     def on_setup(ic):
         ic.visible = True
         threading.Thread(target=agent.run, name="agent", daemon=True).start()
+        rebind_hotkeys()
 
         def apply_state():
             try:
                 st = agent.api_status()
-                ic.title = "%s · %s" % (APP_TITLE, role_label(st.get("role", "")))
+                role = st.get("role", "")
+                ic.title = "%s · %s" % (APP_TITLE, role_label(role))
+                # 图标右下角的圆点跟着角色变色。必须和 title 一起在主线程改。
+                ic.icon = _tray_image(role)
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -744,10 +962,58 @@ def main(argv: list[str] | None = None) -> int:
     ag.ask_user = make_ask_user()
 
     if args.headless:
-        ag.run()
+        # Carbon 事件循环必须占主线程，所以把 agent 挪到后台线程跑。
+        _headless_run(ag, cfg)
         return 0
 
     return run_tray(ag, cfg)
+
+
+def _headless_run(ag, cfg: dict) -> None:
+    """headless 模式：agent 在后台线程，主线程留给 Carbon 事件循环。"""
+    threading.Thread(target=ag.run, name="agent", daemon=True).start()
+    hk = _headless_hotkeys_boot(ag, cfg)
+    if hk is not None:
+        hk.run_event_loop_if_needed()  # 阻塞，直到进程退出
+        return
+    while True:
+        time.sleep(3600)
+
+
+def _headless_hotkeys_boot(ag, cfg: dict):
+    for _ in range(40):
+        if getattr(ag, "running", False):
+            break
+        time.sleep(0.25)
+    if not cfg.get("hotkeys_enabled", True):
+        return None
+    hk = hotkeys.HotkeyManager()
+
+    def fire(to_peer: bool):
+        def go():
+            try:
+                if to_peer:
+                    ag.api_switch_peer("快捷键触发")
+                else:
+                    ag.api_switch("快捷键触发")
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=go, name="hk-fire", daemon=True).start()
+
+    hk.bind(cfg.get("hotkey_to_me"), lambda: fire(False))
+    hk.bind(cfg.get("hotkey_to_peer"), lambda: fire(True))
+    if hk.count():
+        if hk.start():
+            print(
+                "[快捷键] 已启用: %s"
+                % "、".join(str(c) for c, _ in hk.bindings()),
+                flush=True,
+            )
+            return hk
+        if hk.error:
+            print("[快捷键] %s" % hk.error, flush=True)
+    return None
 
 
 if __name__ == "__main__":

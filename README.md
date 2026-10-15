@@ -78,11 +78,13 @@ DDC 通道挂在活跃的视频链路上。显示器一旦切走，另一台机�
 | `ddc_win.py`       | Windows 端 DDC/CI 控制核心。纯 ctypes 调系统 `dxva2.dll`，**零第三方依赖** |
 | `platforms.py`     | 跨平台适配层：DDC 控制 / 显示器在不在 / 键鼠空闲时长                           |
 | `agent.py`         | 两端主程序：角色判定、输入活动检测、局域网委托、本地控制口                             |
-| `kvmctl.py`        | 本地控制客户端，可绑热键                                              |
+| `kvmctl.py`        | 本地控制客户端，`status` / `switch` / `switch-peer` / `autodetect`      |
+| `hotkeys.py`       | 全局热键：macOS 走 Carbon `RegisterEventHotKey`（免授权），Windows 走 `RegisterHotKey` |                                              |
 | `kvm.windows.json` | Windows 端配置模板（命令行方式用）                                     |
 | `kvm.mac.json`     | macOS 端配置模板（命令行方式用）                                       |
 | `selftest/`        | 单机自测，用假实例验证网络与委托逻辑                                        |
 | `packaging/`       | 打包：spec、Inno Setup 脚本、图标生成、Mac 一键构建脚本                     |
+| `.github/workflows/build.yml` | 推 tag 自动在 macOS runner 出 dmg、Windows runner 出 exe/安装包   |
 
 ---
 
@@ -326,9 +328,32 @@ python kvmctl.py auto on       # 恢复自动
 
 如果 agent 改过 `control_port`，加 `--port 47824`。
 
-想绑热键，就让热键去执行 `python kvmctl.py switch` 即可。  
-也可以绑两条：`switch` 拉过来，`switch-peer` 交出去。
-Windows 上可以用 AutoHotkey，macOS 上可以用快捷指令或 skhd。
+### 全局快捷键（内置，不用外挂工具）
+
+不用再装 AutoHotkey / skhd 了，程序自带。在菜单栏图标的菜单里直接设：
+
+- **快捷键 · 切到本机：‹当前键›** → 弹输入框，写 `ctrl+alt+1`
+- **快捷键 · 切到对端：‹当前键›** → 写 `ctrl+alt+2`
+- **启用快捷键** → 总开关（勾掉就完全不抢按键）
+
+写法是 `修饰键 + 主键`，例如 `ctrl+alt+1`、`cmd+shift+m`、`ctrl+alt+f13`。
+修饰键可用 `ctrl`（Mac 上是 ⌃）、`alt`（⌥）、`shift`（⇧）、`cmd`（⌘）；
+主键可用字母、数字、`f1`~`f20`、方向键、`space` 等。**至少要带一个修饰键** ——
+单独一个字母键会和正常打字打架，程序会直接拒绝并提示。留空 = 取消该快捷键。
+
+设完立即生效，并写回 `kvm.json`：
+
+```json
+"hotkeys_enabled": true,
+"hotkey_to_me": "ctrl+alt+1",
+"hotkey_to_peer": "ctrl+alt+2"
+```
+
+macOS 侧用的是 Carbon 的 `RegisterEventHotKey`，**不需要「辅助功能」权限**。
+这一点是特意选的：CGEventTap 那条路必须在系统设置里授权，而 ad-hoc 签名
+（`--sign -`）的 app 每次重新打包 cdhash 都会变、旧授权立刻失配，等于每构建
+一次就要用户重新勾一次权限，没法用。Windows 侧用 `RegisterHotKey`，同样不
+需要管理员权限。
 
 ---
 
@@ -365,6 +390,10 @@ Windows 上请在 Git Bash 里跑。
    反过来「碰 Windows 键鼠切到 Windows」仍必须由 Windows 端发起。
 7. 自动切换靠「键鼠输入活动」判定，所以**如果你用纯触屏或纯 KVM 切换器操作，  
    检测不到输入**，只能用 `kvmctl switch` 手动切。
+8. **Windows 端的全局热键尚未在真机跑过**（`RegisterHotKey` + 消息循环那段）。
+   macOS 侧的 Carbon 实现已实测（⌃⌥1 / ⌃⌥2 双向切换都验证过）。
+   另外 macOS 菜单栏可能把状态图标当 template 渲染成黑白，所以「在不在本机」
+   同时用菜单文本里的 🟢/🔴 表示 —— 那个一定是彩色的。
 
 ---
 

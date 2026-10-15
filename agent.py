@@ -82,6 +82,11 @@ DEFAULT_CONFIG: dict = {
     "input_candidates": [15, 16, 17, 18, 27],
     # 靠对端判断"现在显示的是谁"时，给它多久上报角色
     "peer_settle_seconds": 6.0,
+    # 全局快捷键。"" = 不绑；写成 "ctrl+alt+1" 这种（见 hotkeys.py）。
+    # Mac 上首次使用需要在 系统设置 → 隐私与安全性 → 辅助功能 里勾本程序。
+    "hotkeys_enabled": True,
+    "hotkey_to_me": "ctrl+alt+1",
+    "hotkey_to_peer": "ctrl+alt+2",
 }
 
 

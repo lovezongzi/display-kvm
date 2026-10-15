@@ -14,6 +14,7 @@ HERE = Path(SPECPATH).parent  # noqa: F821  PyInstaller 注入（packaging/ 的�
 hiddenimports = [
     "platforms",
     "ddc_win",
+    "hotkeys",
     "pystray._win32",
     "pystray._util",
     "PIL._tkinter_finder",
