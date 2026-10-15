@@ -185,6 +185,23 @@ bash packaging/build_mac.sh
 
 之后按「⚡ 快速开始」的必做三步配置即可。
 
+**前置条件：Python ≥ 3.10。** 脚本优先找 `/opt/homebrew/bin/python3`，找不到就回退 PATH 里的
+`python3`，然后硬校验版本。系统自带的 `/usr/bin/python3` 是 3.9，会直接报错退出。补一个即可：
+
+```bash
+brew install python        # 或把任意 3.10+ 的解释器放到 PATH 前面
+```
+
+> **macOS 预发布版本（如 27.x）上 Homebrew 常常没有现成 bottle**，`brew install` 会退化成长时间
+> 源码编译、甚至因 Command Line Tools 版本判定直接失败。这时不必跟 brew 较劲 —— m1ddc 只是
+> Objective-C + CoreDisplay，用本机 Command Line Tools 就能编：
+>
+> ```bash
+> curl -sL -o m1ddc.zip https://codeload.github.com/waydabber/m1ddc/zip/refs/tags/v1.2.0
+> unzip -q m1ddc.zip && cd m1ddc-1.2.0 && make
+> install -m 0755 m1ddc /opt/homebrew/bin/m1ddc
+> ```
+
 ### 1. 装 DDC 工具（命令行方式）
 
 ```bash
@@ -199,6 +216,10 @@ m1ddc display list
 m1ddc display 1 get input   # 能返回数字 = DDC 通了
 ```
 
+**注意：`get input` 返回的是「显示器此刻正在显示谁的口」，而不是「本机接在哪个口」。**
+Apple Silicon 上 m1ddc 走的是私有 CoreDisplay 代理，显示器切到对端之后**依然能读能写**，
+所以这个数字必须结合「现在屏幕上是谁」一起解读 —— 详见下一节。
+
 **如果这条报错，说明你的转接设备吃掉了 DDC 通道。**  
 雷电/USB4 扩展坞一般没问题；二三十块的 USB-C 转 HDMI 小线大概率不行。  
 这种情况下本项目对 Mac 侧无效，只能从 Windows 侧单向切过去。
@@ -212,6 +233,17 @@ m1ddc display 1 get input   # 能返回数字 = DDC 通了
 - `token`：和 Windows 端一致
 - `display_index`：`m1ddc display list` 里的序号
 - `ddc_set_cmd` 里的 `{value}` 是十进制，已处理好
+
+> **这两个口填反了，表现是「点『切到本机』反而切到对端去」。**
+> 由于上面说的原因，`m1ddc get input` **不能**直接当作「本机的口」：如果读的时候显示器正显示
+> 对端，读到的就是对端的口。所以务必按这个顺序确认：
+>
+> 1. 手动按显示器按钮，让屏幕显示 Mac；
+> 2. 这时执行 `m1ddc get input`，得到的才是 Mac 的口，写进 `my_input_source`；
+> 3. 对端那个口 = 显示器上剩下的另一个。
+>
+> 还有个跨平台通用的判活技巧：**往一个口下发 `set input` 后观察读数是否自己退回**。
+> 空的输入口会在几秒内被显示器自动退回上一个有信号的口；有信号的活口会稳稳停住。
 
 ### 3. 跑起来
 
@@ -310,8 +342,17 @@ Windows 上请在 Git Bash 里跑。
    （如需彻底解决，要给两台各配一块虚拟屏，见下方"可选的下一步"）。
 3. **必须视频线直连**，或经过雷电/USB4 扩展坞。廉价转接器会吃掉 DDC 通道。
 4. **显示器 OSD 里的 `DDC/CI` 必须开着**，否则一切无效。
-5. **只验证过 Windows 端真实切换**，macOS 端代码未在真机验证（本机不是 Mac）。
-6. 自动切换靠「键鼠输入活动」判定，所以**如果你用纯触屏或纯 KVM 切换器操作，  
+5. **两端都已在真机验证**。Windows 端 + 下面这套 macOS 环境实测通过：
+   MacBook Air（Apple Silicon / macOS 27）+ 共享屏 HKC H27T22C3（Mac 在 DP1 = `0x0F`，
+   Windows 在 DP2 = `0x10`，USB-C 转 DP 直连）。验证覆盖：角色判定、手动切换、
+   以及「显示器在对端时碰本机键鼠自动切回」的完整闭环。
+6. **macOS 上 m1ddc 的 `get input` 返回的是「显示器此刻在显示谁」**，而不是「本机接在哪个口」；
+   且显示器切到对端后 DDC 依然可读可写（Apple Silicon 私有代理）。因此 macOS 的角色判定
+   必须是 `current_input == my_input_source`，**不能**用「读得到就算在显示我」——
+   后者会让角色恒为 active，自动切换永不触发。同时这也意味着 **Mac 端可以独立工作**：
+   显示器在对端时 Mac 自己就能把它切回来，不需要 Windows 端在线；
+   反过来「碰 Windows 键鼠切到 Windows」仍必须由 Windows 端发起。
+7. 自动切换靠「键鼠输入活动」判定，所以**如果你用纯触屏或纯 KVM 切换器操作，  
    检测不到输入**，只能用 `kvmctl switch` 手动切。
 
 ---

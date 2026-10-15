@@ -230,7 +230,20 @@ class Agent:
             return "cooldown"
 
         if self.role == "active":
-            self._perform_switch(self.peer_src, "%s｜本机正在显示器上，直接切" % reason)
+            # 「切到本机」= 把显示器输入源设成本机那个口。这里原来写的是
+            # self.peer_src，语义相反：本机已经在显示器上时点这个按钮，
+            # 会反而把画面切到对端去。
+            self._perform_switch(self.my_src, "%s｜本机正在显示器上，直接切" % reason)
+            return "local"
+
+        # 显示器在对端，但本机是否还能自己写 DDC？
+        # Windows：不能（DDC 只对活跃链路可用）-> 必须委托对端。
+        # macOS/Apple Silicon：能，m1ddc 走私有代理，显示器显示对端时照样可写
+        #   -> 自己切，比委托对端更快，也让 Mac 端不依赖 Windows 端在线。
+        with self._plat_lock:
+            direct = self.platform.can_switch_directly()
+        if direct:
+            self._perform_switch(self.my_src, "%s｜本机可直接操作 DDC，自己切" % reason)
             return "local"
 
         if not self.peer_ip:

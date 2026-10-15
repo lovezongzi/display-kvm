@@ -1,9 +1,17 @@
 """display-kvm 跨平台适配层。
 
 三个能力，每端各自实现：
-  1. target_display_present()  —— 那块共用显示器现在是不是在显示我（等价于 DDC 通道是否可用）
-  2. switch_to(source)         —— 让显示器切到指定输入源（只能由"正在被显示"的一端调用）
+  1. target_display_present()  —— 那块共用显示器现在是不是在显示我
+  2. switch_to(source)         —— 让显示器切到指定输入源
   3. idle_seconds()            —— 本机键鼠已经多久没有输入了
+
+macOS / Apple Silicon 的特殊性（很重要，v1.0.0 在这里判断错了）：
+Windows 上 DDC 只走"当前激活的那条链路"，显示器切到对端后本机就读写不到，
+于是"能读 DDC" ≈ "显示器正在显示我"，两个概念可以合并。
+但 Apple Silicon 上 m1ddc 走的是私有 CoreDisplay 代理，**显示器切到对端之后
+依然能读能写**。所以：
+  - "我在不在显示器上" 只能靠 current_input 与 my_input_source 比较来判断；
+  - "能不能直接切" 恒为真 —— 本机自己就能把显示器切回来，不必委托对端。
 """
 
 from __future__ import annotations
@@ -21,6 +29,18 @@ IS_MAC = sys.platform == "darwin"
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+
+
+def _parse_source(value) -> int | None:
+    """把 '0x10' / '16' / 16 这类写法统一成 int；解析失败返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip(), 0)
+    except ValueError:
+        return None
 
 
 class PlatformBase:
@@ -45,6 +65,15 @@ class PlatformBase:
 
     def idle_seconds(self) -> float | None:
         raise NotImplementedError
+
+    def can_switch_directly(self) -> bool:
+        """本机现在能否直接操作显示器的输入源（不必委托对端）。
+
+        默认用"显示器当前在显示我"近似 —— 这适用于 Windows：DDC 只对活跃
+        链路可用，切换到对端后本机就写不动了，只能委托对端。
+        macOS 上 DDC 通道始终可用，会覆写为恒 True。
+        """
+        return self.target_display_present()
 
     def detail(self) -> str:
         return ""
@@ -140,6 +169,7 @@ class MacPlatform(PlatformBase):
     def __init__(self, cfg: dict):
         super().__init__(cfg)
         self.display_index = cfg.get("display_index", 1)
+        self.my_src = _parse_source(cfg.get("my_input_source"))
         self.get_cmd = cfg.get("ddc_get_cmd", "m1ddc display {index} get input")
         self.set_cmd = cfg.get("ddc_set_cmd", "m1ddc display {index} set input {value}")
 
@@ -167,16 +197,37 @@ class MacPlatform(PlatformBase):
         m = re.search(r"\b(\d+)\b", out)
         return int(m.group(1)) if m else None
 
+    def _on_this_machine(self, cur: int | None) -> bool:
+        """只有当前输入源恰好是本机那个口时，画面才真的在本机。
+
+        Apple Silicon 上 m1ddc 的 DDC 代理在显示器切到对端后仍然可读，
+        所以"读得到"完全不能当作"在显示我"。v1.0.0 就是错在这里：
+        结果 role 恒为 active —— 自动切换永不触发、点击按钮又切错方向。
+        """
+        return cur is not None and self.my_src is not None and cur == self.my_src
+
     def target_display_present(self) -> bool:
-        return self.current_input() is not None
+        return self._on_this_machine(self.current_input())
 
     def probe(self) -> tuple[bool, str, float | None]:
         cur = self.current_input()
+        present = self._on_this_machine(cur)
         if cur is None:
             detail = "共用显示器当前不在本机（DDC 命令无返回）"
-        else:
+        elif present:
             detail = "共用显示器在本机，当前输入源 0x%02X" % cur
-        return cur is not None, detail, self.idle_seconds()
+        else:
+            detail = "共用显示器在对端，当前输入源 0x%02X（本机是 0x%02X）" % (
+                cur,
+                self.my_src if self.my_src is not None else 0,
+            )
+        return present, detail, self.idle_seconds()
+
+    def can_switch_directly(self) -> bool:
+        # Apple Silicon 的 DDC 代理：显示器显示对端时本机照样能下发 set input。
+        # （已在 HKC H27T22C3 + MacBook Air 上实测：显示器正在显示 Windows 时，
+        #  Mac 下发 set input 15 能直接把画面切回来。）
+        return self.current_input() is not None
 
     def switch_to(self, source: int) -> bool:
         rc, out, err = self._run(

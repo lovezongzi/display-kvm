@@ -177,6 +177,11 @@ def autodetect(cfg: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             print("自动探测显示器失败（保持默认值）: %s" % exc)
     elif IS_MAC:
+        # Apple Silicon 上用 m1ddc 读到的"当前输入源"= 显示器此刻正在显示谁的口。
+        # 如果首次启动时显示器正显示对端，读到的就是对端的口；直接写进
+        # my_input_source 会把方向整个写反（v1.0.0 踩的就是这个坑：
+        # 面板上点"切到本机"反而切到了 Windows）。
+        # 所以这里只探测、只提示，不覆盖模板/用户的值。
         try:
             import re
 
@@ -192,7 +197,12 @@ def autodetect(cfg: dict) -> dict:
             if p.returncode == 0:
                 m = re.search(r"\b(\d+)\b", p.stdout or "")
                 if m:
-                    cfg["my_input_source"] = "0x%02X" % int(m.group(1))
+                    print(
+                        "检测到共享显示器当前输入源 0x%02X —— 注意这只表示"
+                        "「此刻显示器在显示谁」，不一定是本机的口。"
+                        "请对照 my_input_source 自行核对（已保持模板值不变）。"
+                        % int(m.group(1))
+                    )
         except Exception:  # noqa: BLE001
             pass
     return cfg
@@ -205,6 +215,10 @@ README_LINES = [
     "3) peer_input_source = 对端接在这台显示器上的输入口。",
     "4) dry_run=true 时只写日志、不真的切换，确认逻辑无误后改 false。",
     "5) 改完配置要重启程序（托盘菜单 -> 退出，再打开）。",
+    "6) macOS：m1ddc 读到的『当前输入源』只表示显示器此刻在显示谁。要在"
+    "显示器正显示本机时读，得到的才是本机的口；否则会读到对端的口。",
+    "7) macOS：Mac 端可以自己直接把显示器切回来（DDC 通道随时可用），"
+    "     不依赖 Windows 端在线。",
 ]
 
 
@@ -473,23 +487,44 @@ def run_tray(agent, cfg: dict) -> int:
 
     icon = pystray.Icon(APP_NAME, _tray_image(), APP_TITLE, menu)
 
+    def _ui_call(fn, *a) -> None:
+        """把 AppKit 调用投递回主线程。
+
+        macOS 上 NSStatusItem 只能在主线程改（pystray 的 _darwin 后端不做任何
+        线程调度，_update_menu/_update_title 直接碰 NSStatusItem）。从后台线程
+        调用会撞上 -[BSServiceMainRunLoopQueue assertBarrierOnQueue]，
+        进程以 EXC_BREAKPOINT/SIGTRAP 直接崩掉。
+        """
+        if IS_MAC:
+            try:
+                from PyObjCTools import AppHelper
+
+                AppHelper.callAfter(fn, *a)
+                return
+            except Exception:  # noqa: BLE001
+                return
+        fn(*a)
+
     def on_setup(ic):
         ic.visible = True
         threading.Thread(target=agent.run, name="agent", daemon=True).start()
 
+        def apply_state():
+            try:
+                st = agent.api_status()
+                ic.title = "%s · %s" % (APP_TITLE, role_label(st.get("role", "")))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ic.update_menu()
+            except Exception:  # noqa: BLE001
+                pass
+
         def refresher():
             while True:
                 time.sleep(2.0)
-                refresh()
-                try:
-                    st = agent.api_status()
-                    ic.title = "%s · %s" % (APP_TITLE, role_label(st.get("role", "")))
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    ic.update_menu()
-                except Exception:  # noqa: BLE001
-                    pass
+                refresh()  # 只写普通 dict，任意线程安全
+                _ui_call(apply_state)
 
         threading.Thread(target=refresher, name="tray-refresh", daemon=True).start()
 
