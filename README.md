@@ -7,14 +7,20 @@
 
 ---
 
-## ⚡ 快速开始（安装包版）
+## ⚡ 下载与安装
 
-不碰 Python 的最短路径。安装包位于 `dist/`：
+不碰 Python 的最短路径：到 [Releases](https://github.com/lovezongzi/display-kvm/releases) 下载对应平台的产物。
 
-| 平台      | 文件                                           | 说明                                                                                     |
-| ------- | -------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Windows | `dist/installer/Display-KVM-Setup-1.0.0.exe` | 双击安装。**已在本机完整实测**（安装→运行→切换→卸载全链路）                                                      |
-| macOS   | `Display-KVM-1.0.0.dmg`                      | **无法在 Windows 上交叉构建**，需在 Mac 上跑 `bash packaging/build_mac.sh` 一键生成（自动装依赖、打 .app、做 dmg） |
+| 平台 | 文件 | 是什么 |
+| --- | --- | --- |
+| Windows | `display-kvm.exe` | **免安装执行文件**（绿色版）。双击直接运行，不用装、不用管理员权限，托盘常驻；配置生成在 `%APPDATA%\display-kvm\kvm.json`。适合先试一下，或者不想往系统里写东西。 |
+| Windows | `Display-KVM-Setup-1.0.1.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
+| macOS | `Display-KVM-1.0.1.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
+
+dmg 只面向 Apple 芯片的 Mac：它内置的 `m1ddc` 依赖 Apple 的私有 CoreDisplay 接口，
+**Intel Mac 上拿不到 DDC 通道**（需要把配置里的 DDC 命令换成 `ddcctl`）。
+另外 dmg 无法在 Windows/Linux 上交叉构建，如需自己打，在 Mac 上跑
+`bash packaging/build_mac.sh` 即可（自动装依赖、打 .app、做 dmg）。
 
 Windows 安装包做了什么：
 
@@ -24,7 +30,6 @@ Windows 安装包做了什么：
 - 首次启动自动生成配置到 `%APPDATA%\display-kvm\kvm.json`，  
   并**自动探测**共用显示器的分辨率和当前输入源——通常只需改 `token` 和 `peer_input_source` 两个值
 - 自带单实例保护，重复双击只会提示"已在运行"
-- 附带 `display-kvm-ctl.exe`（控制台版控制客户端，绑热键用）
 
 双端各装好后，必做三步：
 
@@ -90,8 +95,8 @@ DDC 通道挂在活跃的视频链路上。显示器一旦切走，另一台机�
 
 ## 三、Windows 端安装（命令行方式）
 
-> 用了安装包（`Display-KVM-Setup-1.0.0.exe`）的话，**跳过这一节**，  
-> 直接看「⚡ 快速开始」里的必做三步。以下是从源码跑的方式。
+> 用了安装包（`Display-KVM-Setup-1.0.1.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
+> 直接看「⚡ 下载与安装」里的必做三步。以下是从源码跑的方式。
 
 不需要 `pip install` 任何东西。
 
@@ -174,7 +179,18 @@ schtasks /create /tn "display-kvm" ^
 
 ## 四、macOS 端安装
 
-### 0. 有 dmg 的话（推荐）
+### 0. 从 Releases 拿 dmg（推荐）
+
+下载 `Display-KVM-1.0.1.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
+首次打开若提示「无法验证开发者」，右键 → 打开，或执行：
+
+```bash
+xattr -cr "/Applications/Display KVM.app"
+```
+
+之后按上面「⚡ 下载与安装」里的必做三步配置即可。
+
+### 0.1 想自己构建 dmg
 
 dmg 无法在 Windows 上构建。把整个 `display-kvm/` 文件夹拷到 Mac 上，跑一条命令：
 
@@ -183,10 +199,8 @@ bash packaging/build_mac.sh
 ```
 
 脚本会自动：建隔离虚拟环境 → 装 pyinstaller/pystray/pyobjc → 找或下载 m1ddc 并打包进 app →  
-构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.0.dmg`  
+构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.1.dmg`  
 （带拖拽到 Applications 的布局）。产物在 `dist/` 下。
-
-之后按「⚡ 快速开始」的必做三步配置即可。
 
 **前置条件：Python ≥ 3.10。** 脚本优先找 `/opt/homebrew/bin/python3`，找不到就回退 PATH 里的
 `python3`，然后硬校验版本。系统自带的 `/usr/bin/python3` 是 3.9，会直接报错退出。补一个即可：

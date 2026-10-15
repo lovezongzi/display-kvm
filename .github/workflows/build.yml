@@ -71,7 +71,6 @@ jobs:
           name: display-kvm-windows
           path: |
             dist/display-kvm.exe
-            dist/display-kvm-ctl.exe
             dist/installer/*.exe
 
   release:
