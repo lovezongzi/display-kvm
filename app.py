@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""display-kvm 托盘外壳（打包入口）。
+
+把底层 Agent（agent.py）包装成「装完即用」的常驻程序：
+  * 自动判断 Windows / macOS，不需要手动指定 platform
+  * 配置与日志放在用户目录（打包后的程序目录是只读的）
+  * Windows 托盘 / macOS 菜单栏常驻：
+      看状态、立即切换、自动开关、打开配置/日志、开机自启、退出
+  * 完整保留原命令行能力，其余参数原样透传给 agent.py
+
+用法
+----
+    display-kvm                      # 托盘常驻（默认）
+    display-kvm --headless           # 不开托盘，纯后台跑（日志写文件）
+    display-kvm --status             # 打印一次状态后退出
+    display-kvm --dry-run            # 只记录、不真的切
+    display-kvm --print-config-path  # 打印配置文件路径
+    display-kvm --install-autostart / --remove-autostart
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP_NAME = "display-kvm"
+APP_TITLE = "Display KVM"
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+
+# ---------------------------------------------------------------------- 路径
+
+
+def app_dir() -> Path:
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    elif IS_MAC:
+        base = str(Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    d = Path(base) / APP_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+CONFIG_PATH = app_dir() / "kvm.json"
+LOG_PATH = app_dir() / "display-kvm.log"
+
+
+def resource_path(rel: str) -> Path:
+    """兼容 PyInstaller onefile：资源被解压到 sys._MEIPASS。"""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        p = Path(base) / rel
+        if p.exists():
+            return p
+    return HERE / rel
+
+
+# ---------------------------------------------------------------------- 日志
+
+
+class _Tee:
+    """把多个流合成一个。任何一路失败都不影响其他路。"""
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        n = 0
+        for s in self._streams:
+            try:
+                n = s.write(data) or 0
+            except Exception:  # noqa: BLE001
+                pass
+        return n if n else len(data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def isatty(self):
+        return False
+
+
+def setup_logging() -> None:
+    """windowed 模式下 sys.stdout 是 None，print 会静默丢失——重定向到文件。"""
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 512 * 1024:
+            backup = LOG_PATH.with_suffix(".log.1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+                LOG_PATH.rename(backup)
+            except OSError:
+                pass
+        fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+        fh.write("\n===== %s 启动 =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        sys.stdout = _Tee(sys.__stdout__, fh)
+        sys.stderr = _Tee(sys.__stderr__, fh)
+    except Exception as exc:  # noqa: BLE001
+        print("日志初始化失败: %s" % exc)
+
+
+# ---------------------------------------------------------------------- 配置
+
+
+def build_default_config() -> dict:
+    cfg = {
+        "name": "windows" if IS_WIN else "mac",
+        "platform": "win" if IS_WIN else ("mac" if IS_MAC else "win"),
+        "peer_name": "mac" if IS_WIN else "windows",
+        "peer_ip": "",
+        "token": secrets.token_hex(8),
+        "udp_port": 47821,
+        "peer_udp_port": 0,
+        "control_port": 47822,
+        "my_input_source": "0x10",
+        "peer_input_source": "0x12",
+        "auto_switch": True,
+        "dry_run": True,
+        "tick_ms": 250,
+        "role_poll_seconds": 2.0,
+        "arm_after_idle_seconds": 3.0,
+        "fire_below_idle_seconds": 0.45,
+        "cooldown_seconds": 6.0,
+        "hello_interval_seconds": 3.0,
+    }
+    if IS_WIN:
+        cfg.update({"match_width": 2560, "match_height": 1440})
+    else:
+        # 优先用打包进 app 的 m1ddc（launchd 启动时 PATH 里没有 /opt/homebrew/bin），
+        # 没有打包的就回退到 PATH 里的 m1ddc（Apple Silicon）。
+        m1 = resource_path("bin/m1ddc")
+        ddc = ('"%s"' % m1) if m1.exists() and os.access(str(m1), os.X_OK) else "m1ddc"
+        cfg.update(
+            {
+                "display_index": 1,
+                "ddc_get_cmd": ddc + " display {index} get input",
+                "ddc_set_cmd": ddc + " display {index} set input {value}",
+            }
+        )
+    return autodetect(cfg)
+
+
+def autodetect(cfg: dict) -> dict:
+    """首次生成配置时探测本机，把共用屏的分辨率和当前输入源预填进去。"""
+    if IS_WIN:
+        try:
+            import ddc_win
+
+            ds = ddc_win.list_displays(with_capabilities=False)
+            if ds:
+                best = max(ds, key=lambda d: (d.width or 0) * (d.height or 0))
+                if best.width and best.height:
+                    cfg["match_width"] = best.width
+                    cfg["match_height"] = best.height
+                if best.current_input is not None:
+                    cfg["my_input_source"] = "0x%02X" % best.current_input
+        except Exception as exc:  # noqa: BLE001
+            print("自动探测显示器失败（保持默认值）: %s" % exc)
+    elif IS_MAC:
+        try:
+            import re
+
+            idx = cfg.get("display_index", 1)
+            p = subprocess.run(
+                ["m1ddc", "display", str(idx), "get", "input"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            if p.returncode == 0:
+                m = re.search(r"\b(\d+)\b", p.stdout or "")
+                if m:
+                    cfg["my_input_source"] = "0x%02X" % int(m.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+    return cfg
+
+
+README_LINES = [
+    "display-kvm 配置（JSON 不支持注释，故用 _readme 字段说明）",
+    "1) token 必须与对端完全一致，否则两端互相忽略消息。",
+    "2) my_input_source  = 本机接在这台显示器上的输入口。",
+    "3) peer_input_source = 对端接在这台显示器上的输入口。",
+    "4) dry_run=true 时只写日志、不真的切换，确认逻辑无误后改 false。",
+    "5) 改完配置要重启程序（托盘菜单 -> 退出，再打开）。",
+]
+
+
+def ensure_config(path: Path) -> dict:
+    if path.exists():
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(cfg, dict):
+                return cfg
+            print("配置文件不是 JSON 对象，忽略: %s" % path)
+        except Exception as exc:  # noqa: BLE001
+            print("配置文件解析失败：%s（%s）" % (path, exc))
+        return {}
+
+    cfg = build_default_config()
+    cfg["_readme"] = README_LINES
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("已生成默认配置：%s" % path)
+    return cfg
+
+
+# ---------------------------------------------------------------------- 开机自启
+
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_MAC_PLIST = Path.home() / "Library" / "LaunchAgents" / "cn.displaykvm.agent.plist"
+
+_MAC_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>cn.displaykvm.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>--headless</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"""
+
+
+def _autostart_command() -> str:
+    if IS_FROZEN:
+        return '"%s"' % sys.executable
+    return '"%s" "%s"' % (sys.executable, (HERE / "app.py").resolve())
+
+
+def is_autostart_enabled() -> bool:
+    if IS_WIN:
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as k:
+                winreg.QueryValueEx(k, APP_NAME)
+                return True
+        except OSError:
+            return False
+    if IS_MAC:
+        return _MAC_PLIST.exists()
+    return False
+
+
+def enable_autostart() -> bool:
+    try:
+        if IS_WIN:
+            import winreg
+
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as k:
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, _autostart_command())
+            return True
+        if IS_MAC:
+            exe = sys.executable if IS_FROZEN else str((HERE / "app.py").resolve())
+            _MAC_PLIST.parent.mkdir(parents=True, exist_ok=True)
+            _MAC_PLIST.write_text(
+                _MAC_PLIST_TEMPLATE.format(exe=exe, log=LOG_PATH), encoding="utf-8"
+            )
+            subprocess.run(["launchctl", "load", str(_MAC_PLIST)], capture_output=True)
+            return True
+    except Exception as exc:  # noqa: BLE001
+        print("开启开机自启失败: %s" % exc)
+    return False
+
+
+def disable_autostart() -> bool:
+    try:
+        if IS_WIN:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as k:
+                winreg.DeleteValue(k, APP_NAME)
+            return True
+        if IS_MAC:
+            if _MAC_PLIST.exists():
+                subprocess.run(["launchctl", "unload", str(_MAC_PLIST)], capture_output=True)
+                _MAC_PLIST.unlink()
+            return True
+    except FileNotFoundError:
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print("关闭开机自启失败: %s" % exc)
+    return False
+
+
+# ---------------------------------------------------------------------- 小工具
+
+
+def open_in_system(path: Path) -> None:
+    try:
+        if IS_WIN:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif IS_MAC:
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:  # noqa: BLE001
+        print("打开失败 %s: %s" % (path, exc))
+
+
+def _popup(msg: str) -> None:
+    try:
+        if IS_WIN:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, msg, APP_TITLE, 0x40)
+        elif IS_MAC:
+            safe = msg.replace('"', "'")
+            subprocess.Popen(
+                ["osascript", "-e", 'display dialog "%s" buttons {"好"} default button 1' % safe]
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def already_running(port: int) -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", int(port)), timeout=0.6)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _warn_if_placeholder(cfg: dict) -> None:
+    token = str(cfg.get("token", ""))
+    if not token or "改" in token or "保持" in token or len(token) < 6:
+        print("!! token 还是占位符，两端将互相忽略消息。请编辑配置文件设置一致的随机串。")
+
+
+# ---------------------------------------------------------------------- 托盘
+
+
+def _tray_image():
+    from PIL import Image, ImageDraw
+
+    bundled = resource_path("assets/icon.png")
+    if bundled.exists():
+        try:
+            return Image.open(bundled).convert("RGBA")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 兜底：现场画一个
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([1, 1, size - 2, size - 2], radius=14, fill=(22, 26, 35, 255))
+    d.rounded_rectangle([7, 18, 26, 42], radius=3, fill=(77, 155, 255, 255))
+    d.rounded_rectangle([38, 18, 57, 42], radius=3, fill=(54, 200, 96, 255))
+    d.line([(28, 26), (36, 26)], fill=(232, 238, 248, 255), width=2)
+    d.line([(36, 36), (28, 36)], fill=(232, 238, 248, 255), width=2)
+    return img
+
+
+def run_tray(agent, cfg: dict) -> int:
+    import pystray
+    from pystray import Menu, MenuItem
+
+    state = {"role": "", "detail": "", "peer": "", "auto": agent.auto_on}
+
+    def refresh() -> None:
+        try:
+            r = agent.api_status()
+            state["role"] = r.get("role", "")
+            state["detail"] = r.get("detail", "")
+            state["peer"] = r.get("peer_ip") or "未发现"
+            state["auto"] = bool(r.get("auto"))
+        except Exception as exc:  # noqa: BLE001
+            state["detail"] = "状态读取失败: %s" % exc
+
+    def role_label(role: str) -> str:
+        return {"active": "● 正在显示本机", "idle": "○ 不在本机"}.get(role, role or "…")
+
+    def line_status(item=None) -> str:
+        return "%s · %s" % (agent.name, role_label(state["role"]))
+
+    def line_detail(item=None) -> str:
+        return (state["detail"] or "…")[:64]
+
+    def line_peer(item=None) -> str:
+        return "对端 %s" % state["peer"]
+
+    def do_switch(icon, item):
+        r = agent.api_switch("托盘手动切换")
+        msg = {
+            "local": "本机直接切换已下发",
+            "delegated": "已委托对端切换",
+            "no-peer": "还没发现对端，无法切换",
+            "cooldown": "冷却中，请稍候",
+            "pending": "已提交，稍后生效",
+        }.get(r, r)
+        _notify(icon, APP_TITLE, msg)
+        refresh()
+        icon.update_menu()
+
+    def toggle_auto(icon, item):
+        agent.auto_on = not agent.auto_on
+        _notify(icon, APP_TITLE, "自动切换已%s" % ("开启" if agent.auto_on else "关闭"))
+        refresh()
+        icon.update_menu()
+
+    def open_cfg(icon, item):
+        open_in_system(CONFIG_PATH)
+
+    def open_log(icon, item):
+        open_in_system(LOG_PATH)
+
+    def toggle_startup(icon, item):
+        if is_autostart_enabled():
+            disable_autostart()
+            _notify(icon, APP_TITLE, "已关闭开机自启")
+        else:
+            enable_autostart()
+            _notify(icon, APP_TITLE, "已开启开机自启")
+        icon.update_menu()
+
+    def do_quit(icon, item):
+        try:
+            agent.running = False
+        finally:
+            icon.stop()
+
+    menu = Menu(
+        MenuItem(line_status, None, enabled=False),
+        MenuItem(line_detail, None, enabled=False),
+        MenuItem(line_peer, None, enabled=False),
+        Menu.SEPARATOR,
+        MenuItem("立即切到本机", do_switch),
+        MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
+        Menu.SEPARATOR,
+        MenuItem("打开配置文件", open_cfg),
+        MenuItem("打开日志", open_log),
+        MenuItem("开机自启", toggle_startup, checked=lambda item: is_autostart_enabled()),
+        Menu.SEPARATOR,
+        MenuItem("退出", do_quit),
+    )
+
+    icon = pystray.Icon(APP_NAME, _tray_image(), APP_TITLE, menu)
+
+    def on_setup(ic):
+        ic.visible = True
+        threading.Thread(target=agent.run, name="agent", daemon=True).start()
+
+        def refresher():
+            while True:
+                time.sleep(2.0)
+                refresh()
+                try:
+                    st = agent.api_status()
+                    ic.title = "%s · %s" % (APP_TITLE, role_label(st.get("role", "")))
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    ic.update_menu()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=refresher, name="tray-refresh", daemon=True).start()
+
+    icon.run(setup=on_setup)
+    return 0
+
+
+def _notify(icon, title: str, msg: str) -> None:
+    try:
+        icon.notify(msg, title)
+    except Exception:  # noqa: BLE001
+        print("[notify] %s: %s" % (title, msg))
+
+
+# ---------------------------------------------------------------------- 入口
+
+
+def build_agent_namespace(args) -> argparse.Namespace:
+    return argparse.Namespace(
+        config=str(args.config) if args.config else None,
+        status=False,
+        dry_run=bool(args.dry_run),
+        platform=None,
+        name=None,
+        peer_ip=None,
+        port=None,
+        peer_port=None,
+        control_port=None,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    setup_logging()
+
+    ap = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="display-kvm —— 两台主机共用一台显示器时的输入源自动切换",
+    )
+    ap.add_argument("--config", "-c", help="配置文件路径（默认 %%APPDATA%%\\display-kvm\\kvm.json）")
+    ap.add_argument("--headless", action="store_true", help="不开托盘，纯后台运行")
+    ap.add_argument("--dry-run", action="store_true", help="只记录、不真的切换")
+    ap.add_argument("--status", action="store_true", help="打印一次状态后退出")
+    ap.add_argument("--print-config-path", action="store_true", help="打印配置文件路径后退出")
+    ap.add_argument("--show-config", action="store_true", help="打印当前配置后退出")
+    ap.add_argument("--install-autostart", action="store_true", help="注册开机自启")
+    ap.add_argument("--remove-autostart", action="store_true", help="取消开机自启")
+    args, extra = ap.parse_known_args(argv)
+
+    if args.print_config_path:
+        print(CONFIG_PATH)
+        return 0
+
+    if args.install_autostart:
+        ok = enable_autostart()
+        print("开机自启：%s" % ("已开启" if ok else "开启失败"))
+        return 0 if ok else 1
+
+    if args.remove_autostart:
+        ok = disable_autostart()
+        print("开机自启：%s" % ("已关闭" if ok else "关闭失败"))
+        return 0 if ok else 1
+
+    cfg_path = Path(args.config).expanduser().resolve() if args.config else CONFIG_PATH
+    cfg = ensure_config(cfg_path)
+
+    if args.show_config:
+        print(json.dumps(cfg, ensure_ascii=False, indent=2))
+        return 0
+
+    import agent as agent_mod
+
+    if args.status:
+        return agent_mod.main(["--config", str(cfg_path), "--status"])
+
+    _warn_if_placeholder(cfg)
+
+    port = int(cfg.get("control_port", 47822))
+    if already_running(port):
+        msg = "%s 已经在运行了（控制口 127.0.0.1:%d 已被占用）。" % (APP_TITLE, port)
+        print(msg)
+        if not args.headless:
+            _popup(msg)
+        return 0
+
+    ns = build_agent_namespace(args)
+    ns.config = str(cfg_path)
+    ag = agent_mod.Agent(cfg, ns)
+
+    if args.headless:
+        ag.run()
+        return 0
+
+    return run_tray(ag, cfg)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

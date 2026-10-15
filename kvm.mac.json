@@ -1,0 +1,25 @@
+{
+  "name": "mac",
+  "platform": "mac",
+  "peer_name": "windows",
+
+  "peer_ip": "",
+  "token": "和 Windows 端保持完全一致",
+
+  "udp_port": 47821,
+  "control_port": 47822,
+
+  "my_input_source": "0x12",
+  "peer_input_source": "0x10",
+
+  "display_index": 1,
+  "ddc_get_cmd": "m1ddc display {index} get input",
+  "ddc_set_cmd": "m1ddc display {index} set input {value}",
+
+  "auto_switch": true,
+  "dry_run": true,
+
+  "arm_after_idle_seconds": 3.0,
+  "fire_below_idle_seconds": 0.45,
+  "cooldown_seconds": 6.0
+}

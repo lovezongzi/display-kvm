@@ -1,0 +1,24 @@
+{
+  "name": "windows",
+  "platform": "win",
+  "peer_name": "mac",
+
+  "peer_ip": "",
+  "token": "改成一串只有你知道的随机字符",
+
+  "udp_port": 47821,
+  "control_port": 47822,
+
+  "my_input_source": "0x10",
+  "peer_input_source": "0x12",
+
+  "match_width": 2560,
+  "match_height": 1440,
+
+  "auto_switch": true,
+  "dry_run": true,
+
+  "arm_after_idle_seconds": 3.0,
+  "fire_below_idle_seconds": 0.45,
+  "cooldown_seconds": 6.0
+}

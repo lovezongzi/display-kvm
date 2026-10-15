@@ -1,0 +1,30 @@
+# 构建产物
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-build/
+venv/
+
+# 运行期文件
+*.log
+*.log.1
+
+# 用户自己的配置（模板 kvm.windows.json / kvm.mac.json 仍然提交）
+kvm.json
+
+# 构建脚本临时下载的第三方二进制，不入库
+packaging/m1ddc
+packaging/ddcctl
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

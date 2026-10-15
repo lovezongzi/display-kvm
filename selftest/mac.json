@@ -1,0 +1,15 @@
+{
+  "name": "mac",
+  "platform": "mac",
+  "peer_name": "windows",
+  "peer_ip": "127.0.0.1",
+  "token": "selftest",
+  "udp_port": 47823,
+  "peer_udp_port": 47821,
+  "control_port": 47824,
+  "my_input_source": "0x12",
+  "peer_input_source": "0x10",
+  "display_index": 1,
+  "auto_switch": true,
+  "dry_run": true
+}
