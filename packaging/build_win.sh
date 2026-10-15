@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -29,25 +29,41 @@ die()  { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
 
 say "查找 Python"
 PY_SYS=""
-for c in py python python3; do
-    if command -v "$c" >/dev/null 2>&1; then
-        if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-            PY_SYS="$c"; break
+# CI（GitHub Actions 的 setup-python）会把装好的版本路径放在 pythonLocation 里。
+# 优先用它：runner 的 PATH 里往往还躺着一个更新的 Python（实测抓到过 3.14），
+# 用它构建会给 PyInstaller 带来不必要的版本风险。
+if [ -n "${pythonLocation:-}" ] && [ -x "${pythonLocation}/python.exe" ]; then
+    PY_SYS="${pythonLocation}/python.exe"
+fi
+if [ -z "$PY_SYS" ]; then
+    for c in py python python3; do
+        if command -v "$c" >/dev/null 2>&1; then
+            if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+                PY_SYS="$c"; break
+            fi
         fi
-    fi
-done
+    done
+fi
 [ -n "$PY_SYS" ] || die "找不到 Python 3.10+，请先安装：https://www.python.org/downloads/"
 echo "使用 $($PY_SYS -V 2>&1)"
 
 # ---------------------------------------------------------------- 虚拟环境
 
 say "准备隔离构建环境 .venv-build"
-VENV_PY=".venv-build/Scripts/python.exe"     # Windows
-[ -f "$VENV_PY" ] || VENV_PY=".venv-build/bin/python"   # Git Bash 下的其它情况
-
-if [ ! -f "$VENV_PY" ]; then
+if [ ! -d .venv-build ]; then
     "$PY_SYS" -m venv .venv-build
 fi
+
+# 注意顺序：必须**建完 venv 之后**再找解释器。
+# 之前的写法先按 Windows 路径猜、猜不到就退化成 Unix 路径，而这个退化值在
+# venv 建好后不会被重新计算 —— 于是永远指向不存在的 .venv-build/bin/python，
+# CI 上直接 127 退出（venv 在 Windows 下是 Scripts/python.exe）。
+VENV_PY=""
+for p in ".venv-build/Scripts/python.exe" ".venv-build/Scripts/python" \
+         ".venv-build/bin/python" ".venv-build/bin/python3"; do
+    if [ -f "$p" ]; then VENV_PY="$p"; break; fi
+done
+[ -n "$VENV_PY" ] || die "虚拟环境创建失败：.venv-build 里找不到 python"
 "$VENV_PY" -m pip install --upgrade pip -q
 "$VENV_PY" -m pip install -q pyinstaller pystray pillow
 
