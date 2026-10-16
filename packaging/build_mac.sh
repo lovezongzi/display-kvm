@@ -11,11 +11,11 @@
 #
 # 产物：
 #   dist/Display KVM.app
-#   dist/Display-KVM-1.0.4.dmg
+#   dist/Display-KVM-1.0.5.dmg
 
 set -euo pipefail
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 

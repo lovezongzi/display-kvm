@@ -6,20 +6,16 @@
     再起一套 Tk 主循环容易打架。
 
 所以：
-  * macOS   -> 原生 AppKit 窗口（一个窗口填完所有参数，无模态，靠回调写回）
+  * macOS   -> 原生 AppKit 模态窗口（一个窗口填完所有参数，runModalForWindow_ 阻塞到关闭，
+               并由 delegate 保证红叉也结束模态会话，可反复打开）
   * Windows -> PowerShell 的 WinForms 表单（同样是单窗口多字段，同步返回）
   * 原生窗口都弹不出 -> 由调用方打开配置文件兜底，绝不再退化成「每个参数弹一次」。
 
-调用方：open_settings(cfg, on_save=..., fallback=...)。
-  * Windows 同步返回「被改动的字段」字典（取消/无改动返回 None）；
-  * macOS 弹出无模态窗口后立即返回 OPENED，用户点「保存」时由窗口内部调 on_save 写回；
-  * 两边都弹不出则返回 FALLBACK，并触发 fallback（打开配置文件）。
+调用方：open_settings(cfg, fallback=...)。
+  * 返回「被改动的字段」字典（取消 / 无改动返回 None）；
+  * 原生窗口弹不出来则返回 FALLBACK，并触发 fallback（打开配置文件）。
 
-注意：macOS 上必须在**主线程**调用（和所有 AppKit 调用一样）。
-macOS 用「无模态窗口 + 回调」而不是 runModalForWindow：后者会在 NSApp 上开一个模态会话，
-而从 pystray 的菜单动作里同步调用时，第一次用完会话状态没被完全清掉，
-第二次再开会抛 "may not be invoked inside of a modal session"，被 except 吞掉后回退成打开 JSON。
-改成无模态窗口后每次都能正常打开。
+注意：macOS 上必须在**主线程**调用（和所有 AppKit 调用一样，pystray 的菜单动作即主线程）。
 """
 
 from __future__ import annotations
@@ -168,34 +164,33 @@ def _diff(cfg: dict, answers: dict) -> dict:
 
 
 FALLBACK = "__fallback__"  # 原生窗口弹不出时返回这个，调用方据此打开配置文件
-OPENED = "__opened__"      # macOS 无模态窗口已弹出，保存时由窗口回调写回，调用方无需再处理
+OPENED = "__opened__"  # 已废弃（v1.0.5 起 macOS 走同步模态窗口，不再使用）
 
 
-def open_settings(cfg: dict, on_save=None, fallback=None):
-    """打开设置窗口。
+def open_settings(cfg: dict, fallback=None):
+    """打开设置窗口（一个集中面板，填完点保存即时生效）。
 
     返回：
-      * dict     —— (Windows) 被改动的字段（用户保存了且确有改动）
+      * dict     —— 被改动的字段（用户保存了且确有改动）
       * None     —— 用户取消 / 没改动
       * FALLBACK —— 原生窗口弹不出来（headless、显示服务异常等），已执行 fallback
-      * OPENED   —— (macOS) 无模态窗口已弹出，用户保存时由窗口内部通过 on_save 写回，
-                   调用方无需再处理返回值
 
-    原生窗口（AppKit / WinForms）是一个集中面板；弹不出来时才走 fallback，
+    macOS / Windows 都走原生同步窗口：窗口关闭后返回被改动的字段，
+    调用方负责写配置、同步 agent、刷新托盘。弹不出来时才走 fallback，
     绝不再退化成「每个参数弹一次输入框」。
 
-    macOS 用「无模态窗口 + 回调」而不是 runModalForWindow：后者会在 NSApp 上开启一个
-    模态会话，而本函数是从 pystray 的菜单动作里同步调用的，第一次用完模态会话状态没被
-    完全清掉，第二次再开就会抛 “may not be invoked inside of a modal session”，
-    被下方 except 吞掉后回退成打开 JSON 文件。改成无模态窗口后每次都能正常打开。
+    macOS 用 NSApp.runModalForWindow_ 模态弹出，并给窗口加 delegate 保证红叉关闭也
+    结束模态会话——否则红叉只关窗不结束模态，下一次再开会抛
+    “may not be invoked inside of a modal session”，被 except 吞掉后回退成打开 JSON。
     """
     if IS_MAC:
-        r = _form_mac(cfg, on_save)
-        if r is None and callable(fallback):
-            try:
-                fallback()
-            except Exception:  # noqa: BLE001
-                pass
+        r = _form_mac(cfg)
+        if r is FALLBACK:
+            if callable(fallback):
+                try:
+                    fallback()
+                except Exception:  # noqa: BLE001
+                    pass
             return FALLBACK
         return r
     if IS_WIN:
@@ -224,11 +219,18 @@ def open_settings(cfg: dict, on_save=None, fallback=None):
 # ==========================================================================
 
 
-# macOS 上若设置窗口已经开着，记住它，重复点菜单只把它提到最前，不叠多个窗口
-_mac_settings_window = None
+def _form_mac(cfg: dict):
+    """macOS 原生设置窗口（单窗口集中面板，模态弹出）。
 
+    用 NSApp.runModalForWindow_ 以模态方式显示：菜单动作会一直阻塞到窗口关闭，
+    天然不会「叠多个窗口」，也不会在 NSApp 上留下挂起的模态会话。
 
-def _form_mac(cfg: dict, on_save=None) -> object | None:
+    关键修复：给窗口加 delegate，红叉关闭也走 windowWillClose_ -> stopModal，
+    否则红叉只关窗不结束模态会话，下一次再开就会抛
+    “may not be invoked inside of a modal session”，被 except 吞掉后回退成打开 JSON。
+
+    返回：被改动的字段字典 / 取消或没改动返回 None / 窗口弹不出来返回 FALLBACK。
+    """
     try:
         import objc
         from AppKit import (
@@ -246,18 +248,9 @@ def _form_mac(cfg: dict, on_save=None) -> object | None:
         )
         from Foundation import NSObject, NSMakeRect
     except Exception:  # noqa: BLE001
-        return None
+        return FALLBACK
 
     try:
-        global _mac_settings_window
-        # 已经开着一个就直接提到最前，避免叠多个窗口
-        if _mac_settings_window is not None:
-            try:
-                _mac_settings_window.makeKeyAndOrderFront_(None)
-                return OPENED
-            except Exception:  # noqa: BLE001
-                _mac_settings_window = None
-
         row_h = 62
         W = 560
         H = 96 + row_h * len(FIELDS)
@@ -271,13 +264,6 @@ def _form_mac(cfg: dict, on_save=None) -> object | None:
         )
         win.setTitle_("自动切换参数设置")
         win.center()
-        # 浮在其他窗口之上，体验接近模态，但本身仍是「无模态」窗口，
-        # 因此不会在 NSApp 上留下模态会话，可以反复打开。
-        try:
-            from AppKit import NSModalPanelWindowLevel
-            win.setLevel_(NSModalPanelWindowLevel)
-        except Exception:  # noqa: BLE001
-            pass
 
         root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
         win.setContentView_(root)
@@ -331,33 +317,30 @@ def _form_mac(cfg: dict, on_save=None) -> object | None:
             return ans
 
         class _Ctl(NSObject):
-            def _close(self):
-                global _mac_settings_window
-                try:
-                    win.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                if _mac_settings_window is win:
-                    _mac_settings_window = None
+            def init(self):
+                self = super().init()
+                self._code = 0      # 1=保存 0=取消/关闭
+                self._win = None
+                return self
 
             def ok_(self, sender):  # noqa: ANN001
-                changed = _diff(cfg, read_answers())
-                if changed and callable(on_save):
-                    try:
-                        on_save(changed)
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._close()
+                self._code = 1
+                self._win.close()
 
             def cancel_(self, sender):  # noqa: ANN001
-                self._close()
+                self._code = 0
+                self._win.close()
+
+            def windowShouldClose_(self, sender):  # noqa: ANN001
+                return True
 
             def windowWillClose_(self, notification):  # noqa: ANN001
-                global _mac_settings_window
-                if _mac_settings_window is win:
-                    _mac_settings_window = None
+                # 无论是点「保存」「取消」还是红叉，窗口一关就结束模态会话，
+                # 保证下一次还能再开（否则红叉只关窗不结束模态，下次再开会崩）。
+                NSApp.stopModalWithCode_(self._code)
 
         ctl = _Ctl.alloc().init()
+        ctl._win = win
 
         btn_ok = NSButton.alloc().initWithFrame_(NSMakeRect(W - 190, 20, 80, 30))
         btn_ok.setTitle_("保存")
@@ -374,13 +357,17 @@ def _form_mac(cfg: dict, on_save=None) -> object | None:
         root.addSubview_(btn_cancel)
 
         win.setDelegate_(ctl)
-        _mac_settings_window = win
 
         NSApp.activateIgnoringOtherApps_(True)
         win.makeKeyAndOrderFront_(None)
-        return OPENED
+        rc = NSApp.runModalForWindow_(win)
+        win.orderOut_(None)
+
+        if rc != 1:
+            return None
+        return _diff(cfg, read_answers()) or None
     except Exception:  # noqa: BLE001
-        return None
+        return FALLBACK
 
 
 # ==========================================================================

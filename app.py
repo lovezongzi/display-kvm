@@ -825,24 +825,10 @@ def run_tray(agent, cfg: dict) -> int:
     def do_settings(icon, item) -> None:
         """打开参数设置窗口（一个集中面板，填完点保存即时生效）。
 
-        macOS 走无模态原生窗口：窗口弹出即返回，用户点「保存」时由窗口内部直接回写；
-        Windows 走 PowerShell WinForms，是同步的，这里拿到改动后回写。
-        两种情况下原生窗口都弹不出来时，才打开配置文件兜底。
+        macOS / Windows 都走原生同步窗口：窗口关闭后返回被改动的字段，
+        这里统一写回 cfg / agent / 托盘。原生窗口弹不出来时，才打开配置文件兜底。
         """
-
-        def apply(changed):
-            cfg.update(changed)
-            _save_cfg_fields(changed)
-            # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
-            # 否则要重启才生效。
-            agent.update_cfg(changed)
-            _notify(icon, APP_TITLE, "已保存：%s" % settings.summarize(changed))
-            refresh()
-            icon.update_menu()
-
-        res = settings.open_settings(
-            cfg, on_save=apply, fallback=lambda: open_in_system(CONFIG_PATH)
-        )
+        res = settings.open_settings(cfg, fallback=lambda: open_in_system(CONFIG_PATH))
         if res == settings.FALLBACK:
             _notify(
                 icon,
@@ -850,11 +836,16 @@ def run_tray(agent, cfg: dict) -> int:
                 "设置窗口打不开，已打开配置文件，改完保存后重启程序生效",
             )
             return
-        if res == settings.OPENED:
-            return  # 窗口已弹出，保存时由窗口回调 apply 写回
-        if res is None:
+        if not res:
             return  # 用户取消 / 没改动
-        apply(res)  # Windows 同步路径
+        cfg.update(res)
+        _save_cfg_fields(res)
+        # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
+        # 否则要重启才生效。
+        agent.update_cfg(res)
+        _notify(icon, APP_TITLE, "已保存：%s" % settings.summarize(res))
+        refresh()
+        icon.update_menu()
 
     def open_cfg(icon, item):
         open_in_system(CONFIG_PATH)
