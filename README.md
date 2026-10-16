@@ -14,8 +14,8 @@
 | 平台 | 文件 | 是什么 |
 | --- | --- | --- |
 | Windows | `display-kvm.exe` | **免安装执行文件**（绿色版）。双击直接运行，不用装、不用管理员权限，托盘常驻；配置生成在 `%APPDATA%\display-kvm\kvm.json`。适合先试一下，或者不想往系统里写东西。 |
-| Windows | `Display-KVM-Setup-1.0.1.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
-| macOS | `Display-KVM-1.0.1.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
+| Windows | `Display-KVM-Setup-1.0.2.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
+| macOS | `Display-KVM-1.0.2.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
 
 dmg 只面向 Apple 芯片的 Mac：它内置的 `m1ddc` 依赖 Apple 的私有 CoreDisplay 接口，
 **Intel Mac 上拿不到 DDC 通道**（需要把配置里的 DDC 命令换成 `ddcctl`）。
@@ -95,7 +95,7 @@ DDC 通道挂在活跃的视频链路上。显示器一旦切走，另一台机�
 
 ## 三、Windows 端安装（命令行方式）
 
-> 用了安装包（`Display-KVM-Setup-1.0.1.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
+> 用了安装包（`Display-KVM-Setup-1.0.2.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
 > 直接看「⚡ 下载与安装」里的必做三步。以下是从源码跑的方式。
 
 不需要 `pip install` 任何东西。
@@ -181,7 +181,7 @@ schtasks /create /tn "display-kvm" ^
 
 ### 0. 从 Releases 拿 dmg（推荐）
 
-下载 `Display-KVM-1.0.1.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
+下载 `Display-KVM-1.0.2.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
 首次打开若提示「无法验证开发者」，右键 → 打开，或执行：
 
 ```bash
@@ -199,7 +199,7 @@ bash packaging/build_mac.sh
 ```
 
 脚本会自动：建隔离虚拟环境 → 装 pyinstaller/pystray/pyobjc → 找或下载 m1ddc 并打包进 app →  
-构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.1.dmg`  
+构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.2.dmg`  
 （带拖拽到 Applications 的布局）。产物在 `dist/` 下。
 
 **前置条件：Python ≥ 3.10。** 脚本优先找 `/opt/homebrew/bin/python3`，找不到就回退 PATH 里的
@@ -308,17 +308,27 @@ launchctl load ~/Library/LaunchAgents/cn.displaykvm.agent.plist
 
 ## 五、参数怎么调
 
-都在配置 JSON 里：
+**菜单栏图标 →「参数设置 …」**：一个窗口填完，保存即时生效，不用重启。
+macOS 上是原生窗口，Windows 上是系统表单；万一两边都弹不出来，会自动退化成逐项输入框。
 
-| 字段                        | 默认   | 说明                              |
-| ------------------------- | ---- | ------------------------------- |
-| `arm_after_idle_seconds`  | 3.0  | 本机键鼠静默多久之后，才进入「待触发」状态。调大可减少误触   |
-| `fire_below_idle_seconds` | 0.45 | 空闲时长低于这个值就判定为「刚有输入」。调小更灵敏但要小心噪声 |
-| `cooldown_seconds`        | 6.0  | 两次切换的最小间隔，防止来回抖                 |
-| `role_poll_seconds`       | 2.0  | 多久探测一次「显示器在不在我这儿」               |
-| `auto_switch`             | true | 关掉就只剩手动 `kvmctl switch`         |
+| 窗口里的名字            | 配置字段                     | 默认    | 说明                                                    |
+| ---------------- | ------------------------ | ----- | ----------------------------------------------------- |
+| 启用自动切换           | `auto_switch`            | true  | 关掉就只剩手动切换                                             |
+| 切换后的保护时间（秒）      | `cooldown_seconds`       | 6.0   | 刚切完画面的这段时间内，碰鼠标键盘都不会再触发自动切换。托盘菜单和快捷键的手工切换**不受它限制** |
+| 离开多久后才允许被唤醒（秒）   | `arm_after_idle_seconds` | 3.0   | 画面在对端时，本机键鼠要空闲超过这么久才进入待命状态。调大可减少误触                   |
+| 判定为「有操作」的阈值（秒）   | `fire_below_idle_seconds` | 0.45 | 待命状态下，空闲时长低于这个值就认为你碰了键鼠，立刻切过来                         |
+| 状态检测周期（秒）        | `role_poll_seconds`      | 2.0   | 多久探测一次「画面现在在谁那儿」。越小越灵敏，DDC 查询也越频繁                    |
+| 对端失联判定（秒）        | `peer_timeout_seconds`   | 12.0  | 超过这么久收不到对端心跳就认为它下线了                                   |
+| 演练模式             | `dry_run`                | false | 只写日志，不真的切                                             |
 
-**觉得太容易误触**：把 `arm_after_idle_seconds` 提到 8–10 秒。
+填进窗口的值会自动做范围钳制（比如保护时间最长 120 秒），填了非法值就忽略该项。
+
+也可以直接改配置 JSON 里的同名字段，但**改完要退出再重开才生效**——走设置窗口则不用。
+
+两个常见调法：
+
+- **觉得太容易误触**（走过碰一下桌子就被切走）：把「离开多久后才允许被唤醒」提到 8–10 秒。
+- **切完显示器还没亮又被弹回去**：把「切换后的保护时间」提到 8–10 秒。
 
 ---
 

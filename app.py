@@ -42,6 +42,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import hotkeys  # noqa: E402  放在 sys.path 之后，保证打包后也能找到
+import settings  # noqa: E402  同上
 
 
 # ---------------------------------------------------------------------- 路径
@@ -629,18 +630,16 @@ def run_tray(agent, cfg: dict) -> int:
         return (state["detail"] or "…")[:64]
 
     def line_peer(item=None) -> str:
-        # 对端下线后必须说清楚。原来只要曾经发现过就一直显示 IP + 旧角色，
-        # 看起来像"还连着"，实际上早就断了（v1.0.0 里 peer_ip 永不失效）。
+        # 只报在线 / 离线 / 未发现。
+        # 以前这里会显示对端 IP 和"xx 秒前心跳"：那两个数字对使用者没有
+        # 任何 actionable 的信息，却让菜单每两秒变一次宽度、读起来也费劲。
+        # 真要排查连接问题，日志里都有（对端下线也照样记）。
+        who = cfg.get("peer_name") or "对端"
         if state.get("peer_online"):
-            return "对端 %s · %s · %.0fs 前心跳" % (
-                state.get("peer"),
-                state.get("peer_role"),
-                state.get("peer_age") or 0,
-            )
-        age = state.get("peer_age")
-        if age is None:
-            return "对端 未发现（从未收到心跳）"
-        return "对端 离线（%s，%.0fs 前失去心跳）" % (state.get("peer"), age)
+            return "%s · 在线" % who
+        if state.get("peer_age") is None:
+            return "%s · 未发现" % who
+        return "%s · 离线" % who
 
     def do_switch(icon, item):
         r = agent.api_switch("托盘手动切换")
@@ -777,6 +776,20 @@ def run_tray(agent, cfg: dict) -> int:
         refresh()
         icon.update_menu()
 
+    def do_settings(icon, item) -> None:
+        """打开参数设置窗口（自动切换相关的那几个时间）。"""
+        changed = settings.open_settings(cfg, fallback_ask=_ask_text)
+        if not changed:
+            return
+        cfg.update(changed)
+        _save_cfg_fields(changed)
+        # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
+        # 否则要重启才生效。
+        agent.update_cfg(changed)
+        _notify(icon, APP_TITLE, "已保存：%s" % settings.summarize(changed))
+        refresh()
+        icon.update_menu()
+
     def open_cfg(icon, item):
         open_in_system(CONFIG_PATH)
 
@@ -807,6 +820,7 @@ def run_tray(agent, cfg: dict) -> int:
         MenuItem("立即切到对端（%s）" % (cfg.get("peer_name") or "对端"), do_switch_peer),
         MenuItem("自动探测本机输入口", do_autodetect),
         MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
+        MenuItem("参数设置 …", do_settings),
         Menu.SEPARATOR,
         MenuItem(
             lambda item: "快捷键 · %s：%s" % (HK_TITLE["to_me"], hk_label("to_me")),

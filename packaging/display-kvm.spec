@@ -15,6 +15,7 @@ hiddenimports = [
     "platforms",
     "ddc_win",
     "hotkeys",
+    "settings",
     "pystray._win32",
     "pystray._util",
     "PIL._tkinter_finder",

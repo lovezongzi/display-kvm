@@ -21,9 +21,13 @@ if m1ddc.exists():
 hiddenimports = [
     "platforms",
     "hotkeys",
+    "settings",
     "pystray._darwin",
-    # app.py 里是函数内懒加载，PyInstaller 扫不到
+    # app.py / settings.py 里是函数内懒加载，PyInstaller 扫不到
     "PyObjCTools.AppHelper",
+    "AppKit",
+    "Foundation",
+    "objc",
 ]
 
 a = Analysis(
@@ -73,8 +77,8 @@ app = BUNDLE(
         "CFBundleName": "Display KVM",
         "CFBundleDisplayName": "Display KVM",
         "CFBundleIdentifier": "cn.displaykvm.agent",
-        "CFBundleShortVersionString": "1.0.1",
-        "CFBundleVersion": "1.0.1",
+        "CFBundleShortVersionString": "1.0.2",
+        "CFBundleVersion": "1.0.2",
         "NSHighResolutionCapable": True,
         # 菜单栏应用：不占 Dock、不弹窗口
         "LSUIElement": True,

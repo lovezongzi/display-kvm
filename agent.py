@@ -542,6 +542,26 @@ class Agent:
         """读当前状态缓存。线程安全：只读主循环维护的字段。"""
         return self._status()
 
+    def update_cfg(self, pairs: dict) -> None:
+        """从设置面板改配置。
+
+        必须走这里而不是直接改托盘那份 dict：Agent.__init__ 里做的是
+        cfg = {**DEFAULT_CONFIG, **raw_cfg}，跟外壳拿到的不是同一个对象，
+        改外壳的不会影响主循环（主循环每 tick 读的是 self.cfg）。
+        """
+        self.cfg.update(pairs)
+        if "auto_switch" in pairs:
+            self.auto_on = bool(pairs["auto_switch"])
+        if "my_input_source" in pairs:
+            self.my_src = _src(pairs["my_input_source"])
+            if hasattr(self.platform, "my_src"):
+                self.platform.my_src = self.my_src
+        if "peer_input_source" in pairs:
+            self.peer_src = _src(pairs["peer_input_source"])
+            if hasattr(self.platform, "peer_src"):
+                self.platform.peer_src = self.peer_src
+        log("配置已更新：%s" % "、".join("%s=%s" % (k, v) for k, v in pairs.items()))
+
     def api_switch(self, reason: str = "手动触发") -> str:
         """请求切换，线程安全：走任务队列交给主循环执行。"""
         ev = threading.Event()
