@@ -161,11 +161,27 @@ def _diff(cfg: dict, answers: dict) -> dict:
     return out
 
 
-def open_settings(cfg: dict, fallback_ask=None) -> dict | None:
-    """打开设置窗口，返回被改动的字段字典（未改动/取消返回 None）。"""
+FALLBACK = "__fallback__"  # 原生窗口弹不出时返回这个，调用方据此打开配置文件
+
+
+def open_settings(cfg: dict, fallback=None):
+    """打开设置窗口。
+
+    返回：
+      * dict  —— 被改动的字段（用户保存了且确有改动）
+      * None  —— 用户取消 / 没改动
+      * FALLBACK —— 原生窗口弹不出来（headless、显示服务异常等），已执行 fallback
+
+    原生窗口（AppKit / WinForms）是**一个集中面板**；弹不出来时才走 fallback，
+    绝不再退化成「每个参数弹一次输入框」。
+    """
     answers = _form_mac(cfg) if IS_MAC else _form_win(cfg) if IS_WIN else None
-    if answers is None and fallback_ask is not None:
-        answers = _form_fallback(cfg, fallback_ask)
+    if answers is None and callable(fallback):
+        try:
+            fallback()
+        except Exception:  # noqa: BLE001
+            pass
+        return FALLBACK
     if not answers:
         return None
     return _diff(cfg, answers) or None
@@ -446,25 +462,5 @@ def _form_win(cfg: dict) -> dict | None:
 
 
 # ==========================================================================
-# 兜底：逐项输入框
+# （无兜底逐参数弹窗：原生窗口弹不出时由调用方打开配置文件，见 open_settings）
 # ==========================================================================
-
-
-def _form_fallback(cfg: dict, ask) -> dict | None:
-    answers = {}
-    for f in FIELDS:
-        cur = fmt(cfg.get(f.key, "")) if f.kind != "bool" else ("开" if cfg.get(f.key) else "关")
-        raw = ask(
-            "%s\n\n%s\n\n当前：%s%s"
-            % (
-                f.title,
-                f.hint,
-                cur,
-                "" if f.kind == "bool" else "（范围 %g ~ %g）" % (f.lo, f.hi),
-            ),
-            cur,
-        )
-        if raw is None:
-            return None
-        answers[f.key] = raw
-    return answers

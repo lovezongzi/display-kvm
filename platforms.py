@@ -216,8 +216,12 @@ class MacPlatform(PlatformBase):
         self.my_src = _parse_source(cfg.get("my_input_source"))
         self.get_cmd = cfg.get("ddc_get_cmd", "m1ddc display {index} get input")
         self.set_cmd = cfg.get("ddc_set_cmd", "m1ddc display {index} set input {value}")
+        # 懒加载并缓存 Quartz 动态库句柄：idle_seconds() 每轮轮询都调，
+        # 原来每次都 ctypes.CDLL 重新加载 ApplicationServices 框架，既慢又
+        # 会累积 dyld 引用（轻微泄漏）。
+        self._quartz_lib = None
 
-    def _run(self, cmd: str) -> tuple[int, str, str]:
+    def _run(self, cmd: str, timeout: float = 6.0) -> tuple[int, str, str]:
         try:
             p = subprocess.run(
                 cmd,
@@ -226,7 +230,7 @@ class MacPlatform(PlatformBase):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=6,
+                timeout=timeout,
             )
             return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
         except subprocess.TimeoutExpired:
@@ -235,7 +239,9 @@ class MacPlatform(PlatformBase):
             return 1, "", str(exc)
 
     def current_input(self) -> int | None:
-        rc, out, err = self._run(self.get_cmd.format(index=self.display_index))
+        # 读输入源(轮询)给短超时：m1ddc 正常 <1s，个别显示器休眠时会卡住。
+        # 卡 6s 等于主循环被冻 6s；降到 4s 把最坏卡顿限制住（切换仍用 6s）。
+        rc, out, err = self._run(self.get_cmd.format(index=self.display_index), timeout=4.0)
         if rc != 0:
             self.last_read_ok = False
             return None
@@ -332,9 +338,11 @@ class MacPlatform(PlatformBase):
 
     def _idle_quartz(self) -> float | None:
         try:
-            lib = ctypes.CDLL(
-                "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-            )
+            if self._quartz_lib is None:
+                self._quartz_lib = ctypes.CDLL(
+                    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+                )
+            lib = self._quartz_lib
             lib.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
             lib.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_int32]
             # kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = 0xFFFFFFFF

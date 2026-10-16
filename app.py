@@ -103,10 +103,56 @@ class _Tee:
         return False
 
 
+class _RotatingFile:
+    """按大小滚动的日志文件：超过 max_bytes 就改名为 .log.1 重新开。
+
+    避免长期运行的托盘程序日志无限增长、占满磁盘（常被误当成内存泄漏）。
+    """
+
+    def __init__(self, path: Path, max_bytes: int = 2 * 1024 * 1024):
+        self._path = path
+        self._max = max_bytes
+        self._f = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, data):
+        try:
+            self._f.write(data)
+            if self._f.tell() > self._max:
+                self._rotate()
+        except Exception:  # noqa: BLE001
+            pass
+        return len(data)
+
+    def flush(self):
+        try:
+            self._f.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _rotate(self):
+        try:
+            self._f.close()
+            backup = self._path.with_suffix(".log.1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+            except OSError:
+                pass
+            try:
+                self._path.rename(backup)
+            except OSError:
+                pass
+            self._f = open(self._path, "a", encoding="utf-8", buffering=1)
+            self._f.write("\n===== 日志已轮转（旧内容见 .log.1）=====\n")
+        except Exception:  # noqa: BLE001
+            self._f = open(self._path, "a", encoding="utf-8", buffering=1)
+
+
 def setup_logging() -> None:
     """windowed 模式下 sys.stdout 是 None，print 会静默丢失——重定向到文件。"""
     try:
-        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 512 * 1024:
+        MAX = 2 * 1024 * 1024
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > MAX:
             backup = LOG_PATH.with_suffix(".log.1")
             try:
                 if backup.exists():
@@ -114,7 +160,7 @@ def setup_logging() -> None:
                 LOG_PATH.rename(backup)
             except OSError:
                 pass
-        fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+        fh = _RotatingFile(LOG_PATH, MAX)
         fh.write("\n===== %s 启动 =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
         sys.stdout = _Tee(sys.__stdout__, fh)
         sys.stderr = _Tee(sys.__stderr__, fh)
@@ -777,10 +823,22 @@ def run_tray(agent, cfg: dict) -> int:
         icon.update_menu()
 
     def do_settings(icon, item) -> None:
-        """打开参数设置窗口（自动切换相关的那几个时间）。"""
-        changed = settings.open_settings(cfg, fallback_ask=_ask_text)
-        if not changed:
+        """打开参数设置窗口（一个集中面板，填完点保存即时生效）。
+
+        原生窗口偶尔弹不出来的极端情况：直接打开配置文件，让用户改完重启，
+        不再退化成「每个参数弹一次输入框」。
+        """
+        res = settings.open_settings(cfg, fallback=lambda: open_in_system(CONFIG_PATH))
+        if res is None:
+            return  # 用户取消
+        if res == settings.FALLBACK:
+            _notify(
+                icon,
+                APP_TITLE,
+                "设置窗口打不开，已打开配置文件，改完保存后重启程序生效",
+            )
             return
+        changed = res
         cfg.update(changed)
         _save_cfg_fields(changed)
         # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
@@ -869,8 +927,11 @@ def run_tray(agent, cfg: dict) -> int:
                 st = agent.api_status()
                 role = st.get("role", "")
                 ic.title = "%s · %s" % (APP_TITLE, role_label(role))
-                # 图标右下角的圆点跟着角色变色。必须和 title 一起在主线程改。
-                ic.icon = _tray_image(role)
+                # 图标（右下角状态圆点）只在角色变化时才重绘，避免每 2 秒都新建
+                # 一个 PIL/NSImage 对象，长期运行累积内存压力。
+                if getattr(ic, "_dk_role", None) != role:
+                    ic._dk_role = role
+                    ic.icon = _tray_image(role)
             except Exception:  # noqa: BLE001
                 pass
             try:

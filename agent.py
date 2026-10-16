@@ -424,11 +424,15 @@ class Agent:
             self._drain_ops()
 
             if now >= next_role:
+                # 用探测「开始前」的时间排下一轮：万一 m1ddc 卡住（超时 4s），
+                # 不会一探测完就立刻又排一次，否则主循环会被持续占满、收不到
+                # 心跳/控制口/快捷键——表现为程序「卡死」。先排时间再探测。
+                t_probe = time.time()
                 try:
                     self._refresh_platform_cache()
                 except Exception as exc:  # noqa: BLE001
                     log("探测显示器状态出错: %s" % exc)
-                next_role = now + float(self.cfg["role_poll_seconds"])
+                next_role = t_probe + float(self.cfg["role_poll_seconds"])
 
             if now >= next_hello:
                 self._send_hello()

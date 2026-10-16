@@ -7,7 +7,7 @@
 
 #define MyAppName "Display KVM"
 #define MyAppNameCn "显示器输入源自动切换"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppExeName "display-kvm.exe"
 #define MyAppCtlName "display-kvm-ctl.exe"
 
