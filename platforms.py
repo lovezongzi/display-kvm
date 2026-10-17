@@ -75,6 +75,10 @@ def _parse_source(value) -> int | None:
 class PlatformBase:
     name = "base"
 
+    # 空闲查询是不是"便宜"的：纯 API 调用、可以每 200ms 采一次。
+    # False 表示要起子进程之类的慢操作，只能跟着角色轮询一起做。
+    idle_is_cheap = False
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         # 最近一次 DDC 读是否成功。读失败时上层不应据此改角色（见 agent._refresh_platform_cache）
@@ -124,6 +128,7 @@ class _LASTINPUTINFO(ctypes.Structure):
 
 class WindowsPlatform(PlatformBase):
     name = "win"
+    idle_is_cheap = True  # GetLastInputInfo 就是一次内核调用，随便高频
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
@@ -220,6 +225,9 @@ class MacPlatform(PlatformBase):
         # 原来每次都 ctypes.CDLL 重新加载 ApplicationServices 框架，既慢又
         # 会累积 dyld 引用（轻微泄漏）。
         self._quartz_lib = None
+        # 走 Quartz 时空闲查询是纯内存调用，可以高频采样；一旦退化到
+        # ioreg（要起子进程）就自动降频，见 idle_seconds()。
+        self.idle_is_cheap = True
 
     def _run(self, cmd: str, timeout: float = 6.0) -> tuple[int, str, str]:
         try:
@@ -334,7 +342,12 @@ class MacPlatform(PlatformBase):
     def idle_seconds(self) -> float | None:
         # 优先用 Quartz（无需起子进程）；失败则回退到 ioreg
         v = self._idle_quartz()
-        return v if v is not None else self._idle_ioreg()
+        if v is not None:
+            self.idle_is_cheap = True
+            return v
+        # 只剩 ioreg 子进程时不能高频采样，否则每 200ms 起一次进程
+        self.idle_is_cheap = False
+        return self._idle_ioreg()
 
     def _idle_quartz(self) -> float | None:
         try:
@@ -351,7 +364,9 @@ class MacPlatform(PlatformBase):
             return None
 
     def _idle_ioreg(self) -> float | None:
-        rc, out, err = self._run("ioreg -c IOHIDSystem -d 1")
+        # 必须带 -r：IOHIDSystem 挂在注册表深处，不加 -r 时 -d 1/-d 2 只打印
+        # 到 Root，永远匹配不到 HIDIdleTime（这条回退路径等于一直是坏的）。
+        rc, out, err = self._run("ioreg -c IOHIDSystem -r -d 2")
         if rc != 0:
             return None
         m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)

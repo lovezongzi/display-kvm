@@ -228,6 +228,11 @@ class Agent:
         # 平台状态缓存：只在主循环里更新，其他线程只读
         self.cached_detail = ""
         self.cached_idle: float | None = None
+        # 上一拍的空闲值。空闲计时器只会被输入事件清零，所以「这一拍比上一拍
+        # 明显更小」= 这期间发生过键鼠活动 —— 用它做触发判据，比要求采样点
+        # 恰好落在活动后的 0.45 秒窗口里可靠得多。
+        self._last_idle: float | None = None
+        self._next_idle_at = 0.0
 
         # 任务队列：UDP / 控制口线程把活丢进来，主循环执行
         self.ops: queue.Queue = queue.Queue()
@@ -441,6 +446,7 @@ class Agent:
             if not self.paired:
                 return
             self.paired = False
+            self.cfg["paired"] = False
             self._offered_nonce = None
             self._offered_token = None
             self.pair_error = None
@@ -464,6 +470,7 @@ class Agent:
             self.token = incoming
             self.cfg["token"] = incoming
             self.paired = True
+            self.cfg["paired"] = True
             self._offered_nonce = None
             self.pair_error = None
             self._save_cfg()
@@ -482,6 +489,7 @@ class Agent:
                 return
             # 对端确认采纳了本机发出的 token
             self.paired = True
+            self.cfg["paired"] = True
             self._save_cfg()
             self._offered_nonce = None
             self.pair_error = None
@@ -522,6 +530,7 @@ class Agent:
                 self.token = prev_token
                 self.cfg["token"] = prev_token
                 self.paired = False
+                self.cfg["paired"] = False
                 self._offered_nonce = None
                 self._offered_token = None
                 self.pair_error = "配对失败：未收到对端应答（已回滚）"
@@ -556,6 +565,7 @@ class Agent:
         self._offered_token = new_token
         self._offered_nonce = nonce
         self.paired = False  # 等 accept 确认
+        self.cfg["paired"] = False  # 等 accept 确认后才置 true
         self.pair_candidates.clear()
         threading.Thread(target=blast, name="pair", daemon=True).start()
         log("已开始局域网配对，等待对端采纳共享 token …")
@@ -573,6 +583,7 @@ class Agent:
         self.token = secrets.token_hex(8)
         self.cfg["token"] = self.token
         self.paired = False
+        self.cfg["paired"] = False
         self._offered_nonce = None
         self.pair_error = None
         self.pair_candidates.clear()
@@ -731,6 +742,32 @@ class Agent:
 
     # ------------------------------------------------------------------ 主循环
 
+    def _sample_idle(self, now: float) -> None:
+        """单独、高频地采样键鼠空闲时长。
+
+        空闲值原本只在 _refresh_platform_cache() 里顺带取一次，而那个函数要
+        跑 m1ddc 子进程、每 role_poll_seconds（默认 2 秒）才跑一次。等于是
+        每 2 秒才看一眼「有没有键鼠活动」，而触发条件又是 idle <= 0.45 秒
+        —— 要求采样点正好落在你动手后的 0.45 秒窗口内。碰一下鼠标几乎必然
+        错过，表现就是「我明明动了鼠标，屏幕就是不切」。
+
+        空闲查询本身很便宜（Mac 是 Quartz 调用，Windows 是 GetLastInputInfo
+        调用，都不碰显示器），所以拆出来单独高频采样；平台层若只能靠子进程
+        查询（idle_is_cheap=False），则退回跟随角色轮询的频率。
+        """
+        cheap = getattr(self.platform, "idle_is_cheap", False)
+        interval = 0.2 if cheap else float(self.cfg.get("role_poll_seconds", 2.0))
+        if now < self._next_idle_at:
+            return
+        self._next_idle_at = now + interval
+        try:
+            with self._plat_lock:
+                idle = self.platform.idle_seconds()
+        except Exception:  # noqa: BLE001
+            return
+        if idle is not None:
+            self.cached_idle = idle
+
     def _tick_auto(self) -> None:
         if self.probing:
             return  # 正在探测输入源，别来抢画面
@@ -738,18 +775,29 @@ class Agent:
         if idle is None:
             return
 
+        prev = self._last_idle
+        self._last_idle = idle
+
         if self.role != "idle":
             self.armed = False
             return
 
+        # 用 _to_float 兜底：万一配置被外部改成字符串/空值，这里不会抛
+        # TypeError 把整个自动切换拖死（历史上这里每秒报错刷屏）。
+        arm = _to_float(self.cfg.get("arm_after_idle_seconds"), 3.0)
+        fire = _to_float(self.cfg.get("fire_below_idle_seconds"), 0.45)
+
         if not self.armed:
-            # 用 _to_float 兜底：万一配置被外部改成字符串/空值，这里不会抛
-            # TypeError 把整个自动切换拖死（历史上这里每秒报错刷屏）。
-            if idle >= _to_float(self.cfg.get("arm_after_idle_seconds"), 3.0):
+            if idle >= arm:
                 self.armed = True
             return
 
-        if idle <= _to_float(self.cfg.get("fire_below_idle_seconds"), 0.45):
+        # 两种"本机有输入活动"的证据，任一成立即触发：
+        #   1) 采样到刚发生输入（空闲时间极短）——判据严、容易被采样漏掉；
+        #   2) 空闲计时器被重置过（这一拍比上一拍明显变小）——只要这两拍之间
+        #      发生过任何一次输入就一定能看到，不再依赖采样时机。
+        activity = idle <= fire or (prev is not None and prev - idle > 0.25 and idle < arm)
+        if activity:
             self.armed = False
             self.request_switch("检测到本机键鼠活动")
 
@@ -785,6 +833,7 @@ class Agent:
             now = time.time()
 
             self._drain_ops()
+            self._sample_idle(now)
 
             if now >= next_role:
                 # 用探测「开始前」的时间排下一轮：万一 m1ddc 卡住（超时 4s），
