@@ -19,7 +19,12 @@ if m1ddc.exists():
     datas.append((str(m1ddc), "bin"))
 
 hiddenimports = [
-    # kvm_platform 是懒加载/动态 import，PyInstaller 静态扫不到
+    # 本地包：agent.py 是在 main() 里才 import 的，kvm_platform 也是懒加载，
+    # 显式列出来避免依赖 PyInstaller 的字节码扫描碰运气。
+    "kvm_app",
+    "kvm_app.entry",
+    "kvm_app.tray",
+    "kvm_core",
     "kvm_platform",
     "hotkeys",
     "settings",
