@@ -471,9 +471,12 @@ Windows 上请在 Git Bash 里跑。
   `display-kvm-mac.spec`、`version_info.txt`），发版时漏改就出现「tag 是 1.0.13、
   产物却叫 1.0.12」这种事（本版第一轮构建就踩了）。
 - 现在只认仓库根的 `VERSION` 文件：两个构建脚本读它（`KVM_VERSION` 可覆盖），
-  mac spec 从它取 `CFBundleShortVersionString`，`installer.iss` 用
-  `/DMyAppVersion=` 注入，`version_info.txt` 由 `build_win.sh` 就地重写。
-- 且在带 tag 的提交上构建时，tag 与 `VERSION` 不一致会**直接失败**，不再默默出错包。
+  mac spec 从它取 `CFBundleShortVersionString`，`version_info.txt` 与
+  `installer.iss` 的 `#define MyAppVersion` 由 `build_win.sh` 在打包前就地重写。
+  （不要试图用 `ISCC /DMyAppVersion=` 注入：Git Bash 会把 `/D...` 当路径转换，
+  ISCC 会报「不能指定多个脚本文件」。）
+- 且在带 tag 的提交上构建时（CI 用 `GITHUB_REF_NAME` 兜底，因为浅克隆拿不到 tag），
+  tag 与 `VERSION` 不一致会**直接失败**，不再默默出错包。
 
 ### v1.0.12
 
