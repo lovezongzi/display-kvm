@@ -310,25 +310,24 @@ def _form_mac(cfg: dict):
                 controls[f.key] = tf
 
         def read_answers():
+            # 必须在窗口关闭【之前】调用：close() 会把窗口连同子控件一起释放，
+            # 之后再去读 c.state()/c.stringValue() 会访问已释放的 ObjC 对象 -> EXC_BAD_ACCESS。
+            # 这里直接转成 Python 原生值（str / bool），彻底脱离 ObjC 对象生命周期。
             ans = {}
             for f in FIELDS:
                 c = controls[f.key]
-                ans[f.key] = bool(c.state()) if f.kind == "bool" else c.stringValue()
+                ans[f.key] = bool(c.state()) if f.kind == "bool" else str(c.stringValue())
             return ans
 
         class _Ctl(NSObject):
-            def init(self):
-                self = super().init()
-                self._code = 0      # 1=保存 0=取消/关闭
-                self._win = None
-                return self
-
             def ok_(self, sender):  # noqa: ANN001
                 self._code = 1
+                self._answers = self._read()  # 关窗前先把值读出来
                 self._win.close()
 
             def cancel_(self, sender):  # noqa: ANN001
                 self._code = 0
+                self._answers = None
                 self._win.close()
 
             def windowShouldClose_(self, sender):  # noqa: ANN001
@@ -341,6 +340,9 @@ def _form_mac(cfg: dict):
 
         ctl = _Ctl.alloc().init()
         ctl._win = win
+        ctl._read = read_answers
+        ctl._code = 0
+        ctl._answers = None
 
         btn_ok = NSButton.alloc().initWithFrame_(NSMakeRect(W - 190, 20, 80, 30))
         btn_ok.setTitle_("保存")
@@ -363,9 +365,9 @@ def _form_mac(cfg: dict):
         rc = NSApp.runModalForWindow_(win)
         win.orderOut_(None)
 
-        if rc != 1:
+        if rc != 1 or ctl._answers is None:
             return None
-        return _diff(cfg, read_answers()) or None
+        return _diff(cfg, ctl._answers) or None
     except Exception:  # noqa: BLE001
         return FALLBACK
 
