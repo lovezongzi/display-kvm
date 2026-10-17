@@ -14,8 +14,8 @@
 | 平台 | 文件 | 是什么 |
 | --- | --- | --- |
 | Windows | `display-kvm.exe` | **免安装执行文件**（绿色版）。双击直接运行，不用装、不用管理员权限，托盘常驻；配置生成在 `%APPDATA%\display-kvm\kvm.json`。适合先试一下，或者不想往系统里写东西。 |
-| Windows | `Display-KVM-Setup-1.0.9.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
-| macOS | `Display-KVM-1.0.9.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
+| Windows | `Display-KVM-Setup-1.0.10.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
+| macOS | `Display-KVM-1.0.10.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
 
 dmg 只面向 Apple 芯片的 Mac：它内置的 `m1ddc` 依赖 Apple 的私有 CoreDisplay 接口，
 **Intel Mac 上拿不到 DDC 通道**（需要把配置里的 DDC 命令换成 `ddcctl`）。
@@ -99,7 +99,7 @@ DDC 通道挂在活跃的视频链路上。显示器一旦切走，另一台机�
 
 ## 三、Windows 端安装（命令行方式）
 
-> 用了安装包（`Display-KVM-Setup-1.0.9.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
+> 用了安装包（`Display-KVM-Setup-1.0.10.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
 > 直接看「⚡ 下载与安装」里的必做三步。以下是从源码跑的方式。
 
 不需要 `pip install` 任何东西。
@@ -185,7 +185,7 @@ schtasks /create /tn "display-kvm" ^
 
 ### 0. 从 Releases 拿 dmg（推荐）
 
-下载 `Display-KVM-1.0.9.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
+下载 `Display-KVM-1.0.10.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
 首次打开若提示「无法验证开发者」，右键 → 打开，或执行：
 
 ```bash
@@ -203,7 +203,7 @@ bash packaging/build_mac.sh
 ```
 
 脚本会自动：建隔离虚拟环境 → 装 pyinstaller/pystray/pyobjc → 找或下载 m1ddc 并打包进 app →  
-构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.9.dmg`  
+构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.10.dmg`  
 （带拖拽到 Applications 的布局）。产物在 `dist/` 下。
 
 **前置条件：Python ≥ 3.10。** 脚本优先找 `/opt/homebrew/bin/python3`，找不到就回退 PATH 里的
@@ -436,6 +436,40 @@ Windows 上请在 Git Bash 里跑。
 ---
 
 ## 十、更新日志
+
+### v1.0.10
+
+**修复**
+
+1. **配对死锁：卡住的那一端，另一端对它完全无能为力**  
+   一端停留在 `paired=true` 而 token 与对端不一致时（v1.0.7 的遗留状态），它会
+   拒绝一切新的配对请求，而对端**没有任何手段请它松口** —— 唯一出路是走到那台
+   机器前手动点「解除配对」，偏偏那一端常常正是看不见异常的那台。  
+   改法：新增 `pairing_reset` 报文作为带外恢复通道。一端解除配对时会请对端一并
+   解除；发起配对前也先重置一次，确保对端处于可协商状态。  
+   安全性：reset 只认「知道当前或上一个共享 token」的对端，且只发给已知的对端
+   地址、**不广播**。不知道 token 的第三方拆不散已配对的两端。
+2. **token 不一致是静默故障，界面上完全看不出来**  
+   旧代码对校验不过的报文只打一行日志就丢掉，日志会无限刷（实测累计 6000+ 条），
+   而状态查询和托盘菜单都不显示「两端已经对不上」，用户只会觉得切换没反应。  
+   改法：日志按对端 IP 节流；`status` 与托盘「配对状态」行都会提示 token 不一致。
+3. **自动自愈**  
+   已配对却在 30 秒内累计 10 次 token 校验失败，即判定两端错乱，自动解除配对并
+   请对端一并解除，之后在**任意一端**点「配对两端」就能恢复。  
+   判据刻意取「收到了对端报文但校验失败」，而不是「没收到心跳」—— 对端只是关机
+   时，不该把配对解掉。
+
+**新功能**
+
+1. **控制口新增 `pair` / `unpair` / `reset-peer`**  
+   此前配对只能从托盘菜单点，脚本、快捷键、远程诊断都介入不了，出问题时也没有
+   命令行出口。现在 `python kvmctl.py unpair` 就能解开死锁。
+2. **自测脚本 `selftest/test_pairing.py`**  
+   同机起两个实例，端到端验证死锁可复现、reset 能解开、伪造 token 被拒、
+   关机不误判、解除后能重新配对。
+3. **Windows 版本资源里的数字版本号补上**  
+   exe 属性里的 `filevers` / `prodvers` 一直停在 1.0.2，只有字符串版本号跟着走，
+   右键看「详细信息」会显示错误的版本。
 
 ### v1.0.9
 

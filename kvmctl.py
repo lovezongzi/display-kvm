@@ -11,7 +11,13 @@ Alfred / 快捷指令 / AutoHotkey 上，实现一键切换。
     python kvmctl.py autodetect    自动探测本机接在哪个输入口上
     python kvmctl.py auto off      暂停自动切换
     python kvmctl.py auto on       恢复自动切换
+    python kvmctl.py pair          发起局域网配对
+    python kvmctl.py unpair        解除配对（并请对端一并解除）
+    python kvmctl.py reset-peer    只请对端解除配对，本端不动
     python kvmctl.py --port 47824 status
+
+unpair / reset-peer 是配对死锁的正规出口：对端卡在「已配对」时会拒绝一切
+新配对请求，过去只能跑到那台机器上去点托盘，现在从命令行就能解开。
 """
 
 from __future__ import annotations
@@ -44,7 +50,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
-        help="status | switch | switch-peer | autodetect | auto on | auto off | quit",
+        help="status | switch | switch-peer | autodetect | auto on | auto off | "
+             "pair | unpair | reset-peer | quit",
     )
     args = ap.parse_args(argv)
 
@@ -69,6 +76,10 @@ def main(argv: list[str]) -> int:
         print("显示器      : %s" % st.get("detail"))
         print("键鼠空闲    : %s" % ("%.1f 秒" % idle if isinstance(idle, (int, float)) else "未知"))
         print("自动切换    : %s%s" % ("开" if st.get("auto") else "关", "（已就绪，等待本机键鼠活动）" if st.get("armed") else ""))
+        paired = "已配对" if st.get("paired") else "未配对"
+        if st.get("token_mismatch"):
+            paired += "  <-- 与 %s 的 token 不一致，即将自动解除" % st.get("token_mismatch_with")
+        print("配对        : %s" % paired)
         print("DRY-RUN     : %s" % ("是" if st.get("dry_run") else "否"))
         if st.get("peer_online"):
             peer = "%s  角色=%s  %.0fs 前心跳" % (

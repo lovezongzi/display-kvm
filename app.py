@@ -647,6 +647,7 @@ def run_tray(agent, cfg: dict) -> int:
         "peer_age": None,
         "auto": agent.auto_on,
         "paired": agent.paired,
+        "token_mismatch": False,
     }
 
     def refresh() -> None:
@@ -660,6 +661,7 @@ def run_tray(agent, cfg: dict) -> int:
             state["peer_age"] = r.get("peer_age_seconds")
             state["auto"] = bool(r.get("auto"))
             state["paired"] = bool(r.get("paired"))
+            state["token_mismatch"] = bool(r.get("token_mismatch"))
         except Exception as exc:  # noqa: BLE001
             state["detail"] = "状态读取失败: %s" % exc
 
@@ -710,6 +712,10 @@ def run_tray(agent, cfg: dict) -> int:
         if err:
             return "配对状态 · %s" % err
         if state.get("paired"):
+            # 已配对却持续收到校验不过的报文：过去这个状态只在日志里刷屏，
+            # 界面上完全看不出来，用户只会觉得「切换没反应」。
+            if state.get("token_mismatch"):
+                return "配对状态 · token 不一致，正在自动解除以便重新配对"
             return "配对状态 · 已配对"
         cands = getattr(agent, "pair_candidates", {})
         if cands:
@@ -853,8 +859,10 @@ def run_tray(agent, cfg: dict) -> int:
         _ui_call(_update_menu)
 
     def do_unpair(icon, item):
-        agent.unpair()
-        _notify(icon, APP_TITLE, "已解除配对，恢复可被发现")
+        # reset_peer：顺带请对端一起解除。否则本端解了、对端还卡在「已配对」，
+        # 它就会一直拒绝新的配对请求 —— 这正是 v1.0.7 那个死局的另一半。
+        agent.unpair(reset_peer=True)
+        _notify(icon, APP_TITLE, "已解除配对，并已通知对端一并解除")
         _ui_call(_update_menu)
 
     def _on_paired(ok, peer, msg):

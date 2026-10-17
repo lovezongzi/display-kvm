@@ -53,6 +53,9 @@ DEFAULT_CONFIG: dict = {
     "peer_ip": "",  # 留空则靠 UDP 广播自动发现
     "token": "change-me",
     "paired": False,  # 是否已通过局域网配对（配对后不再接受新配对，防被劫持）
+    "last_token": "",  # 上一次的共享 token。对端请求解除配对时拿它认人：
+    # 两端 token 已经错乱时，发起方手里只有旧 token，
+    # 只认「当前 token」的话 reset 永远受理不了，死锁就解不开。
     # 端口（peer_udp_port 留 0 表示与 udp_port 相同；同机双实例自测时可分开设）
     "udp_port": 47821,
     "peer_udp_port": 0,
@@ -189,6 +192,12 @@ class Agent:
         self._offered_token = None  # 发起配对时生成的共享 token
         self._session_nonce = secrets.token_hex(4)  # 本次运行的 announce 标识
         self.pair_candidates = {}  # ip -> 对端名（未配对候选，供托盘显示）
+        # token 不一致的观测状态：已配对却持续收到校验不过的报文，说明两端
+        # token 已经错乱。这类状态过去只能靠用户去「出错的那一端」手动解除。
+        self._mismatch_window_start = 0.0
+        self._mismatch_count: dict[str, int] = {}
+        self._mismatch_log_at: dict[str, float] = {}
+        self.token_mismatch_with = ""  # 最近检测到不一致的对端 IP，"" = 无
         # 最近一次配对的结果说明（失败原因）。Windows 上系统通知经常被静默抑制，
         # 托盘菜单状态行是唯一一定看得见的反馈，所以失败原因要放在这里。
         self.pair_error = None
@@ -259,14 +268,18 @@ class Agent:
         kind = msg.get("t")
         # 配对消息先于 token 校验处理：未配对的两端要靠它协商出共享 token，
         # 此时双方 token 还不一致，走普通校验会被直接丢弃。
-        if kind in ("pairing_announce", "pairing_offer", "pairing_accept"):
+        if kind in ("pairing_announce", "pairing_offer", "pairing_accept", "pairing_reset"):
             self._on_pairing(msg, addr)
             return
         if msg.get("from") == self.name:
             return
         if str(msg.get("token")) != self.token:
-            log("忽略来自 %s 的消息：token 不匹配" % addr[0])
+            self._on_token_mismatch(addr[0])
             return
+        # 走到这里说明 token 对上了，清掉此前累积的不一致观测。
+        if self.token_mismatch_with == addr[0]:
+            self.token_mismatch_with = ""
+            self._mismatch_count.pop(addr[0], None)
 
         # 任何一条合法消息都算一次心跳（hello / switch_request / ack 都算）
         self.peer_last_seen = time.time()
@@ -298,6 +311,80 @@ class Agent:
 
         elif kind == "ack":
             log("对端确认：切换%s" % ("成功" if msg.get("ok") else "失败"))
+
+    # -------------------------------------------------- token 不一致的观测与自愈
+
+    # 判定「两端 token 已经错乱」的阈值：窗口内累计这么多次校验失败。
+    MISMATCH_WINDOW_SECONDS = 30.0
+    MISMATCH_TRIGGER_COUNT = 10
+    MISMATCH_LOG_EVERY = 30.0  # 同一 IP 的日志节流间隔
+
+    def _on_token_mismatch(self, ip: str) -> None:
+        """收到校验不过的报文。
+
+        未配对时两端 token 本来就不同，这是正常的，直接静默（否则会一直刷日志）。
+        已配对却持续校验失败，说明 token 错乱 —— 节流记日志，达到阈值就自愈。
+
+        判据必须是「收到了对端报文但校验失败」，不能是「没收到心跳」：
+        对端只是关机时，不该把配对解掉。
+        """
+        if not self.paired:
+            return
+
+        now = time.time()
+        if now - self._mismatch_window_start > self.MISMATCH_WINDOW_SECONDS:
+            self._mismatch_window_start = now
+            self._mismatch_count.clear()
+
+        n = self._mismatch_count.get(ip, 0) + 1
+        self._mismatch_count[ip] = n
+        self.token_mismatch_with = ip
+
+        if now - self._mismatch_log_at.get(ip, 0.0) >= self.MISMATCH_LOG_EVERY:
+            self._mismatch_log_at[ip] = now
+            log(
+                "忽略来自 %s 的消息：token 不匹配（%.0f 秒内 %d 次）"
+                % (ip, self.MISMATCH_WINDOW_SECONDS, n)
+            )
+
+        if n < self.MISMATCH_TRIGGER_COUNT:
+            return
+
+        # 自愈：本端降级，并请对端一并降级。过去这一步只能由用户去「出错的
+        # 那一端」点托盘，而那一端往往正是看不见问题的那台机器。
+        self._mismatch_count.clear()
+        self._mismatch_log_at.pop(ip, None)
+        self.token_mismatch_with = ""
+        log(
+            "与 %s 的 token 持续不一致（%.0f 秒内 %d 次），判定为两端错乱，"
+            "自动解除配对以便重新协商" % (ip, self.MISMATCH_WINDOW_SECONDS, n)
+        )
+        self.unpair(reset_peer=True)
+        self._fire_paired(
+            False,
+            ip,
+            "检测到与 %s 的 token 不一致，已自动解除配对。请在任意一端重新点「配对两端」。" % ip,
+        )
+
+    def _send_reset(self) -> bool:
+        """请对端解除配对。
+
+        只发给已知的对端地址，不广播 —— 广播 reset 等于允许局域网里任何主机
+        拆散别人的配对。对端会核对报文里的 token 是否等于它当前或上一个共享
+        token，两个都对不上就忽略，强度与现有的 token 校验同级别。
+        """
+        targets: list[str] = []
+        if self.peer_ip:
+            targets.append(self.peer_ip)
+        for ip in self.pair_candidates:
+            if ip not in targets:
+                targets.append(ip)
+        if not targets:
+            return False
+        for ip in targets:
+            self._send({"t": "pairing_reset", "from": self.name}, ip)
+        log("已请求对端解除配对（%s）" % ", ".join(targets))
+        return True
 
     # ------------------------------------------------------------------ 配对
 
@@ -337,6 +424,30 @@ class Agent:
                     self.on_discovered(who, addr[0])
                 except Exception:  # noqa: BLE001
                     pass
+            return
+
+        if kind == "pairing_reset":
+            # 带外恢复通道。只认「知道当前或上一个共享 token」的对端，
+            # 不知道 token 的第三方拆不散已配对的两端，强度与普通校验同级。
+            # 这是解开死锁的关键：卡住的那端会拒绝一切 offer，
+            # 没有它就只能靠用户去那台机器上点托盘。
+            incoming = str(msg.get("token") or "")
+            known = [self.token]
+            last = str(self.cfg.get("last_token") or "")
+            if last:
+                known.append(last)
+            if not incoming or incoming not in known:
+                return
+            if not self.paired:
+                return
+            self.paired = False
+            self._offered_nonce = None
+            self._offered_token = None
+            self.pair_error = None
+            self.pair_candidates[addr[0]] = who
+            # 不换 token：换了新的反而让两端差距更大，等下次配对协商即可。
+            self._save_cfg()
+            log("对端 %s 请求解除配对，已恢复未配对状态" % who)
             return
 
         if kind == "pairing_offer":
@@ -431,8 +542,13 @@ class Agent:
         # 否则两端 token 不一致，会一直报「token 不匹配」。
         prev_token = self.token
         self.pair_error = None
+        # 先请对端一并解除：它若卡在 paired=true 会忽略一切 offer，
+        # 不先重置就永远配不上。必须在换 token 之前发 —— 对端是按「当前或
+        # 上一个共享 token」认人的，换完再发它就认不出来了。
+        self._send_reset()
         if self.paired:
             self.unpair()  # 已配对先解除，再重新协商
+        self.cfg["last_token"] = prev_token
         new_token = secrets.token_hex(8)
         nonce = secrets.token_hex(4)
         self.token = new_token
@@ -444,8 +560,16 @@ class Agent:
         threading.Thread(target=blast, name="pair", daemon=True).start()
         log("已开始局域网配对，等待对端采纳共享 token …")
 
-    def unpair(self) -> None:
-        """解除配对：换一个新随机 token 并恢复可被发现，便于重新配对。"""
+    def unpair(self, reset_peer: bool = False) -> None:
+        """解除配对：换一个新随机 token 并恢复可被发现，便于重新配对。
+
+        reset_peer=True 时先请对端一并解除，避免「本端解了、对端还卡着」的
+        半边状态。必须先发再换 token，理由同 start_pairing。
+        """
+        if reset_peer:
+            self._send_reset()
+        # 旧 token 留一份：对端若带着它来请求解除，才认得出来。
+        self.cfg["last_token"] = self.token
         self.token = secrets.token_hex(8)
         self.cfg["token"] = self.token
         self.paired = False
@@ -715,6 +839,10 @@ class Agent:
             "peer_role": self.peer_role,
             "peer_online": self.peer_online,
             "paired": self.paired,
+            # 已配对却持续收到校验不过的报文 —— 两端 token 错乱的信号。
+            # 过去这个状态只在日志里刷屏，状态查询里看不见。
+            "token_mismatch": bool(self.token_mismatch_with),
+            "token_mismatch_with": self.token_mismatch_with,
             "peer_age_seconds": (time.time() - self.peer_last_seen) if self.peer_last_seen else None,
             "my_input_source": "0x%02X" % self.my_src,
             "peer_input_source": "0x%02X" % self.peer_src,
@@ -740,6 +868,18 @@ class Agent:
             self.ops.put(op)
             ev.wait(3.0)
             return {"ok": True, "action": op.get("result", "pending")}
+
+        if line == "pair":
+            self.start_pairing()
+            return {"ok": True, "action": "pairing_started"}
+
+        if line == "unpair":
+            self.unpair(reset_peer=True)
+            return {"ok": True, "action": "unpaired"}
+
+        if line in ("reset-peer", "reset peer", "resetpeer"):
+            ok = self._send_reset()
+            return {"ok": ok, "action": "reset_sent" if ok else "no_known_peer"}
 
         if line == "autodetect":
             self.autodetect_async()
