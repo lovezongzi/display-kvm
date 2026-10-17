@@ -1,17 +1,15 @@
 ; display-kvm Windows 安装包脚本
 ; 构建（在 display-kvm 目录下）：
 ;   bash packaging/build_win.sh              # 一键：装环境 -> 打 exe -> 打安装包
-; 或只编译安装包（需已装 Inno Setup 6）：
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.13 packaging\installer.iss
+; 或只编译安装包（需已装 Inno Setup 6，版本号得自己先把下面的 MyAppVersion 填好）：
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
 ; 产物：dist\installer\Display-KVM-Setup-<版本>.exe
 
 #define MyAppName "Display KVM"
 #define MyAppNameCn "显示器输入源自动切换"
-; 版本号由 build_win.sh 用 /DMyAppVersion= 注入（单一来源是仓库根的 VERSION 文件）。
-; 这里的 #ifndef 只是手工编译时的兜底，别再往这里写死版本号。
-#ifndef MyAppVersion
-  #define MyAppVersion "0.0.0"
-#endif
+; 版本号由 build_win.sh 在打包前就地重写，单一来源是仓库根的 VERSION 文件。
+; 不要手工改这一行；单独用 ISCC 编译（不走脚本）时才需要自己填。
+#define MyAppVersion "1.0.13"
 #define MyAppExeName "display-kvm.exe"
 #define MyAppCtlName "display-kvm-ctl.exe"
 

@@ -31,8 +31,13 @@ VERSION="${KVM_VERSION:-$(tr -d '[:space:]' < VERSION 2>/dev/null || true)}"
 # 在带 tag 的提交上构建时强校验一次：tag 与 VERSION 不一致直接失败，
 # 免得又产出「版本对不上」的包（CI 就是靠这条兜住）。
 TAG="$(git describe --tags --exact-match 2>/dev/null || true)"
+# CI 的 checkout 是浅的，git describe 拿不到 tag；用 GITHUB_REF_NAME 兜底，
+# 让「tag 与 VERSION 不一致」在流水线上当场失败，而不是产出一个错版本号的包。
+case "${GITHUB_REF_NAME:-}" in
+    v*) TAG="$GITHUB_REF_NAME" ;;
+esac
 if [ -n "$TAG" ] && [ "v$VERSION" != "$TAG" ]; then
-    die "版本不一致：git tag 是 $TAG，但 VERSION 文件写的是 $VERSION。"
+    die "版本不一致：git tag 是 ${TAG}，但 VERSION 文件写的是 ${VERSION}。"
 fi
 echo "版本: $VERSION"
 

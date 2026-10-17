@@ -31,8 +31,13 @@ VERSION="${KVM_VERSION:-$(tr -d '[:space:]' < VERSION 2>/dev/null || true)}"
 [ -n "$VERSION" ] || die "读不到版本号：根目录的 VERSION 文件为空或不存在。"
 
 TAG="$(git describe --tags --exact-match 2>/dev/null || true)"
+# CI 的 checkout 是浅的，git describe 拿不到 tag；用 GITHUB_REF_NAME 兜底，
+# 让「tag 与 VERSION 不一致」在流水线上当场失败，而不是产出一个错版本号的包。
+case "${GITHUB_REF_NAME:-}" in
+    v*) TAG="$GITHUB_REF_NAME" ;;
+esac
 if [ -n "$TAG" ] && [ "v$VERSION" != "$TAG" ]; then
-    die "版本不一致：git tag 是 $TAG，但 VERSION 文件写的是 $VERSION。"
+    die "版本不一致：git tag 是 ${TAG}，但 VERSION 文件写的是 ${VERSION}。"
 fi
 export KVM_VERSION="$VERSION"
 echo "版本: $VERSION"
@@ -85,11 +90,14 @@ say "生成图标"
 "$VENV_PY" packaging/make_icons.py
 
 # ---------------------------------------------------------------- 版本资源
-# version_info.txt 是 PyInstaller 的 --version-file，版本号由这里按 VERSION 就地
-# 重写一遍：它没法从环境变量取值，之前只能手工改，一忘就是「exe 属性里还是旧版本」。
+# 两个文件都得带上版本号，又都不能从环境变量取值，所以在这里按 VERSION 就地重写：
+#   version_info.txt  PyInstaller 的 --version-file（exe 属性里看到的东西）
+#   installer.iss     Inno Setup 的 #define（安装包文件名与「应用和功能」里的版本）
+# 以前这两处靠手工维护，一忘就是「tag 是新的、产物还是旧版本」。
+# 顺带一提：别想着用 ISCC /DMyAppVersion= 注入 —— Git Bash 会把 /D... 当路径转换，
+# 结果 ISCC 收到两个脚本名，报 "You may not specify more than one script filename"。
 say "同步 Windows 版本资源 -> $VERSION"
 "$VENV_PY" - "$VERSION" <<'PY'
-import pathlib
 import re
 import sys
 
@@ -98,18 +106,33 @@ nums = [int(p) for p in re.findall(r"\d+", version)][:4]
 nums += [0] * (4 - len(nums))
 fours = "(%d, %d, %d, %d)" % tuple(nums)
 
-p = pathlib.Path("packaging/version_info.txt")
-s = p.read_text(encoding="utf-8")
-s = re.sub(r"filevers=\([^)]*\)", "filevers=" + fours, s)
-s = re.sub(r"prodvers=\([^)]*\)", "prodvers=" + fours, s)
-s = re.sub(r'StringStruct\("FileVersion", "[^"]*"\)',
-           'StringStruct("FileVersion", "%s")' % version, s)
-s = re.sub(r'StringStruct\("ProductVersion", "[^"]*"\)',
-           'StringStruct("ProductVersion", "%s")' % version, s)
-p.write_text(s, encoding="utf-8")
+
+def rewrite(path, subs):
+    # newline="" 是为了原样保留换行符（installer.iss 在 Windows 上可能是 CRLF）
+    with open(path, encoding="utf-8", newline="") as f:
+        s = f.read()
+    for pattern, repl in subs:
+        s = re.sub(pattern, repl, s)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(s)
+    print("version synced:", path)
+
+
+rewrite("packaging/version_info.txt", [
+    (r"filevers=\([^)]*\)", "filevers=" + fours),
+    (r"prodvers=\([^)]*\)", "prodvers=" + fours),
+    (r'StringStruct\("FileVersion", "[^"]*"\)',
+     'StringStruct("FileVersion", "%s")' % version),
+    (r'StringStruct\("ProductVersion", "[^"]*"\)',
+     'StringStruct("ProductVersion", "%s")' % version),
+])
+
+rewrite("packaging/installer.iss", [
+    (r'(?m)^(#define MyAppVersion )"[^"]*"', r'\1"%s"' % version),
+])
 # 只能用 ASCII 打印：Windows runner 的控制台是 cp1252，
 # print 中文会 UnicodeEncodeError 直接把构建打断。
-print("version resource synced:", p)
+print("done")
 PY
 
 # ---------------------------------------------------------------- exe
@@ -142,8 +165,7 @@ fi
 
 if [ -n "$ISCC" ]; then
     say "编译安装包"
-    # 版本号从命令行注入，installer.iss 里只留 #ifndef 兜底，不必手工维护。
-    "$ISCC" "/DMyAppVersion=$VERSION" packaging/installer.iss
+    "$ISCC" packaging/installer.iss
 else
     warn "没找到 Inno Setup，跳过安装包（手动装：winget install JRSoftware.InnoSetup）"
 fi
