@@ -13,11 +13,11 @@
 # 产物：
 #   dist/display-kvm.exe          主程序（托盘常驻，无控制台窗口）
 #   dist/display-kvm-ctl.exe      控制台客户端（绑热键用）
-#   dist/installer/Display-KVM-Setup-1.0.11.exe   安装包（若装了 Inno Setup）
+#   dist/installer/Display-KVM-Setup-1.0.12.exe   安装包（若装了 Inno Setup）
 
 set -euo pipefail
 
-VERSION="1.0.11"
+VERSION="1.0.12"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 

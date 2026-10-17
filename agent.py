@@ -203,6 +203,7 @@ class Agent:
         self.pair_error = None
         self.on_paired = None       # (ok: bool, peer: str, msg: str) -> None
         self.on_discovered = None   # (name: str, ip: str) -> None
+        self.on_auto_sync = None    # (on: bool) -> None，对端把自动切换同步过来时回调
         self.my_src = _src(cfg["my_input_source"])
         self.peer_src = _src(cfg["peer_input_source"])
 
@@ -262,6 +263,22 @@ class Agent:
         self._send(msg, self.peer_ip)
         return True
 
+    def set_auto_switch(self, on: bool, broadcast: bool = True) -> None:
+        """改自动切换的唯一入口：写内存、落盘、（可选）广播给对端。
+
+        broadcast=False 用于「接收对端同步消息」时，否则两端会无限互发形成回声环路。
+        只有用户在本端主动改（GUI 开关 / 设置面板保存 / kvmctl auto on|off）才走 broadcast=True。
+        """
+        on = bool(on)
+        self.auto_on = on
+        self.cfg["auto_switch"] = on
+        self._save_cfg()
+        if broadcast:
+            payload = {"t": "config_sync", "auto_switch": on}
+            self._send(payload, "255.255.255.255")
+            if self.peer_ip:
+                self._send(payload, self.peer_ip)
+
     def _send_hello(self) -> None:
         msg = {"t": "hello", "role": self.role, "platform": self.platform.name}
         if self.peer_ip:
@@ -316,6 +333,11 @@ class Agent:
 
         elif kind == "ack":
             log("对端确认：切换%s" % ("成功" if msg.get("ok") else "失败"))
+
+        elif kind == "config_sync":
+            # 对端改了可同步的配置（目前只有 auto_switch）。这条消息已经过 token
+            # 校验，只有已配对的对端能发得进来；接收端只镜像、不回播，避免环路。
+            self._on_config_sync(msg)
 
     # -------------------------------------------------- token 不一致的观测与自愈
 
@@ -406,6 +428,26 @@ class Agent:
                 self.on_paired(ok, peer, msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _on_config_sync(self, msg: dict) -> None:
+        """对端把可同步配置推过来（目前只有 auto_switch），本端镜像并落盘。
+
+        这里**不**回播：set_auto_switch 默认 broadcast=True 才会广播，而本函数
+        直接改 auto_on/cfg 并落盘，不走广播，因此不会触发对端再回推，无环路。
+        """
+        if "auto_switch" in msg:
+            val = bool(msg["auto_switch"])
+            if val == self.auto_on and bool(self.cfg.get("auto_switch")) == val:
+                return
+            self.auto_on = val
+            self.cfg["auto_switch"] = val
+            self._save_cfg()
+            log("已按对端设置同步自动切换：%s" % ("开启" if val else "关闭"))
+            if callable(self.on_auto_sync):
+                try:
+                    self.on_auto_sync(val)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _on_pairing(self, msg: dict, addr) -> None:
         """处理 announce / offer / accept。
@@ -935,12 +977,12 @@ class Agent:
             return {"ok": True, "action": "started"}
 
         if line == "auto on":
-            self.auto_on = True
+            self.set_auto_switch(True)
             log("自动切换已开启")
             return {"ok": True, "auto": True}
 
         if line == "auto off":
-            self.auto_on = False
+            self.set_auto_switch(False)
             log("自动切换已关闭")
             return {"ok": True, "auto": False}
 
@@ -996,7 +1038,9 @@ class Agent:
         """
         self.cfg.update(pairs)
         if "auto_switch" in pairs:
-            self.auto_on = bool(pairs["auto_switch"])
+            # set_auto_switch 负责写内存 + 落盘 + 广播给对端（避免本端改了、
+            # 对端还按旧值抢屏）。其余字段保持原处理逻辑。
+            self.set_auto_switch(bool(pairs["auto_switch"]))
         if "my_input_source" in pairs:
             self.my_src = _src(pairs["my_input_source"])
             if hasattr(self.platform, "my_src"):

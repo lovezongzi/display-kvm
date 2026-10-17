@@ -849,8 +849,10 @@ def run_tray(agent, cfg: dict) -> int:
         _ui_call(_update_menu)
 
     def toggle_auto(icon, item):
-        agent.auto_on = not agent.auto_on
-        _notify(icon, APP_TITLE, "自动切换已%s" % ("开启" if agent.auto_on else "关闭"))
+        new_on = not agent.auto_on
+        cfg["auto_switch"] = new_on
+        agent.set_auto_switch(new_on)
+        _notify(icon, APP_TITLE, "自动切换已%s（已同步到对端）" % ("开启" if new_on else "关闭"))
         _ui_call(_update_menu)
 
     def do_pair(icon, item):
@@ -883,6 +885,20 @@ def run_tray(agent, cfg: dict) -> int:
 
     agent.on_paired = _on_paired
     agent.on_discovered = _on_discovered
+
+    def _on_auto_sync(on: bool):
+        # 对端把自动切换推过来：更新本端内存 + 外壳配置 + 托盘菜单 + 提示。
+        # 注意只在 UDP 线程回调里被打，必须用 _ui_call 回到主线程碰 UI。
+        cfg["auto_switch"] = on
+
+        def ui():
+            _notify(icon, APP_TITLE, "自动切换已按对端同步为%s" % ("开启" if on else "关闭"))
+            refresh()
+            icon.update_menu()
+
+        _ui_call(ui)
+
+    agent.on_auto_sync = _on_auto_sync
 
     def do_settings(icon, item) -> None:
         """打开参数设置窗口（一个集中面板，填完点保存即时生效）。
