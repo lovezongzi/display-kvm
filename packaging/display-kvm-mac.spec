@@ -19,11 +19,12 @@ if m1ddc.exists():
     datas.append((str(m1ddc), "bin"))
 
 hiddenimports = [
-    "platforms",
+    # kvm_platform 是懒加载/动态 import，PyInstaller 静态扫不到
+    "kvm_platform",
     "hotkeys",
     "settings",
     "pystray._darwin",
-    # app.py / settings.py 里是函数内懒加载，PyInstaller 扫不到
+    # app / tray / settings 里是函数内懒加载，PyInstaller 扫不到
     "PyObjCTools.AppHelper",
     "AppKit",
     "Foundation",

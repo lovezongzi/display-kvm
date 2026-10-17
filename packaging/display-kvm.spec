@@ -12,7 +12,8 @@ from pathlib import Path
 HERE = Path(SPECPATH).parent  # noqa: F821  PyInstaller 注入（packaging/ 的父级，即项目根）
 
 hiddenimports = [
-    "platforms",
+    # kvm_platform 是懒加载/动态 import，PyInstaller 静态扫不到
+    "kvm_platform",
     "ddc_win",
     "hotkeys",
     "settings",
