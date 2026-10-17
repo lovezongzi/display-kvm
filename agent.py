@@ -126,6 +126,9 @@ class Agent:
         self._offered_token = None  # 发起配对时生成的共享 token
         self._session_nonce = secrets.token_hex(4)  # 本次运行的 announce 标识
         self.pair_candidates = {}  # ip -> 对端名（未配对候选，供托盘显示）
+        # 最近一次配对的结果说明（失败原因）。Windows 上系统通知经常被静默抑制，
+        # 托盘菜单状态行是唯一一定看得见的反馈，所以失败原因要放在这里。
+        self.pair_error = None
         self.on_paired = None       # (ok: bool, peer: str, msg: str) -> None
         self.on_discovered = None   # (name: str, ip: str) -> None
         self.my_src = _src(cfg["my_input_source"])
@@ -288,6 +291,7 @@ class Agent:
             self.cfg["token"] = incoming
             self.paired = True
             self._offered_nonce = None
+            self.pair_error = None
             self._save_cfg()
             self._send_raw(
                 {"t": "pairing_accept", "from": self.name, "nonce": msg.get("nonce")},
@@ -306,6 +310,7 @@ class Agent:
             self.paired = True
             self._save_cfg()
             self._offered_nonce = None
+            self.pair_error = None
             who = msg.get("from")
             log("配对成功：%s 已采纳本机共享 token" % who)
             self._fire_paired(True, who, "已与 %s 配对" % who)
@@ -333,15 +338,36 @@ class Agent:
                 for ip in targets:
                     self._send_raw(offer, ip)
                 time.sleep(0.8)
-            # 超时仍未被采纳（UDP 可能丢包 / 对端没收到）：本机已经用上这个新 token，
-            # 直接置为已配对。这样即便 accept 回包丢了，只要对端采纳了，两端 token 仍一致。
+            # 超时仍未被采纳：**绝不能假装成功**。
+            # 一旦这里置 paired=True 并保留新 token，而对端根本没收到 offer（防火墙 /
+            # 广播不可达 / 对端已配对而忽略），两端 token 就永久不一致，之后所有消息
+            # 都会被对端判为「token 不匹配」；而且本机 paired=True 后会忽略新的 offer，
+            # 再点「配对两端」也没用 —— 死局。所以必须回滚到发起前的 token，
+            # 保持未配对，让两端回到一致状态，用户可以修好网络后再试。
             if self._offered_nonce is not None and not self.paired:
-                self.paired = True
+                self.token = prev_token
+                self.cfg["token"] = prev_token
+                self.paired = False
+                self._offered_nonce = None
+                self._offered_token = None
+                self.pair_error = "配对失败：未收到对端应答（已回滚）"
                 self._save_cfg()
+                port = self.cfg.get("udp_port")
+                log(
+                    "配对失败：%.1f 秒内未收到对端应答，已回滚原 token。"
+                    "请确认对端已运行、两端同网段、防火墙放行 UDP %s" % (4 * 0.8, port)
+                )
                 self._fire_paired(
-                    True, "", "已写入共享 token（未收到对端回包，请确认对端在线）"
+                    False,
+                    "",
+                    "配对失败：未收到对端应答，已回滚原 token。"
+                    "请确认对端已运行、两端在同一网段，且防火墙放行 UDP %s" % port,
                 )
 
+        # 必须在任何改动之前记下原 token：超时失败时要回滚到它，
+        # 否则两端 token 不一致，会一直报「token 不匹配」。
+        prev_token = self.token
+        self.pair_error = None
         if self.paired:
             self.unpair()  # 已配对先解除，再重新协商
         new_token = secrets.token_hex(8)
@@ -361,6 +387,7 @@ class Agent:
         self.cfg["token"] = self.token
         self.paired = False
         self._offered_nonce = None
+        self.pair_error = None
         self.pair_candidates.clear()
         self._save_cfg()
         log("已解除配对，恢复可被发现状态")

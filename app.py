@@ -704,6 +704,11 @@ def run_tray(agent, cfg: dict) -> int:
         return "%s · 离线" % who
 
     def line_pair(item=None):
+        # 配对失败原因优先显示：Windows 的系统通知经常被静默抑制，
+        # 菜单状态行是唯一一定能看到的反馈。
+        err = getattr(agent, "pair_error", None)
+        if err:
+            return "配对状态 · %s" % err
         if state.get("paired"):
             return "配对状态 · 已配对"
         cands = getattr(agent, "pair_candidates", {})
