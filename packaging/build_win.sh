@@ -107,7 +107,9 @@ s = re.sub(r'StringStruct\("FileVersion", "[^"]*"\)',
 s = re.sub(r'StringStruct\("ProductVersion", "[^"]*"\)',
            'StringStruct("ProductVersion", "%s")' % version, s)
 p.write_text(s, encoding="utf-8")
-print(p.read_text(encoding="utf-8").count(version), "处版本号已写入", p)
+# 只能用 ASCII 打印：Windows runner 的控制台是 cp1252，
+# print 中文会 UnicodeEncodeError 直接把构建打断。
+print("version resource synced:", p)
 PY
 
 # ---------------------------------------------------------------- exe
