@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""自动切换网络同步回归测试（v1.0.12 新增 config_sync）。
+"""自动切换网络同步回归测试（v1.0.12 新增 config_sync），pytest 化。
 
 验证：
   1. A 端改自动切换 -> B 端镜像，且 B 立刻落盘
@@ -8,6 +8,7 @@
   4. 未配对（token 不一致）的报文被丢弃，不会误同步
 
 全程只跑 UDP 线程，不碰真实显示器（platform=mac、dry_run=True）。
+手动跑：python selftest/test_auto_sync.py
 """
 
 from __future__ import annotations
@@ -22,19 +23,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent as agent_mod  # noqa: E402
+import pytest  # noqa: E402
 
 PORT_A = 47931
 PORT_B = 47933
 
-results: list[tuple[str, bool, str]] = []
 
-
-def check(name: str, ok: bool, detail: str = "") -> None:
-    results.append((name, ok, detail))
-    print("  %s %s%s" % ("PASS" if ok else "FAIL", name, ("  —— " + detail) if detail else ""))
-
-
-def make_agent(name: str, udp_port: int, peer_udp_port: int, token: str) -> "agent_mod.Agent":
+def _make_agent(name: str, udp_port: int, peer_udp_port: int, token: str) -> "agent_mod.Agent":
     cfg = {
         "name": name,
         "platform": "mac",
@@ -63,57 +58,49 @@ def make_agent(name: str, udp_port: int, peer_udp_port: int, token: str) -> "age
     return a
 
 
-def main() -> int:
-    print("=" * 60)
-    print("自动切换网络同步测试（v1.0.12）")
-    print("=" * 60)
-
-    a = make_agent("win-a", PORT_A, PORT_B, "shared-token-0001")
-    b = make_agent("mac-b", PORT_B, PORT_A, "shared-token-0001")
+@pytest.fixture(scope="module")
+def pair():
+    a = _make_agent("win-a", PORT_A, PORT_B, "shared-token-0001")
+    b = _make_agent("mac-b", PORT_B, PORT_A, "shared-token-0001")
     time.sleep(0.3)
-
-    # ---------------------------------------------------------------- 1
-    print("\n[1] A 开 -> B 应镜像为开，并落盘")
-    a.set_auto_switch(True)
-    time.sleep(0.6)
-    check("B.auto_on 变为 True", b.auto_on is True)
-    check("B 配置写回磁盘为 true", '"auto_switch": true' in open(b.cfg_path).read())
-
-    # ---------------------------------------------------------------- 2
-    print("\n[2] B 关 -> A 应镜像为关（双向）")
-    b.set_auto_switch(False)
-    time.sleep(0.6)
-    check("A.auto_on 变为 False", a.auto_on is False)
-    check("A 配置写回磁盘为 false", '"auto_switch": false' in open(a.cfg_path).read())
-
-    # ---------------------------------------------------------------- 3
-    print("\n[3] 值相同不触发回声：重复下发同一值不应有副作用/应快速稳定")
-    a.set_auto_switch(True)        # 广播 True
-    time.sleep(0.6)
-    b.set_auto_switch(True)        # B 本地也置 True（值相同，_on_config_sync 应直接 return）
-    time.sleep(0.6)
-    check("两端最终一致=开且无异常", a.auto_on is True and b.auto_on is True)
-
-    # ---------------------------------------------------------------- 4
-    print("\n[4] 未配对（token 不一致）的同步报文被丢弃")
-    a.token = "wrong-token"
-    a.cfg["token"] = "wrong-token"
-    safe_b = b.auto_on
-    a.set_auto_switch(False)       # 用错误 token 广播
-    time.sleep(0.6)
-    check("B 未被错误 token 的报文改变", b.auto_on == safe_b,
-          "B.auto_on=%s (期望维持 %s)" % (b.auto_on, safe_b))
-
+    yield a, b
     a.running = b.running = False
 
-    print("\n" + "=" * 60)
-    bad = [r for r in results if not r[1]]
-    print("共 %d 项，通过 %d，失败 %d" % (len(results), len(results) - len(bad), len(bad)))
-    for name, _, detail in bad:
-        print("  失败：%s  %s" % (name, detail))
-    print("=" * 60)
-    return 1 if bad else 0
+
+def test_a_on_mirrors_to_b_and_persists(pair):
+    a, b = pair
+    a.set_auto_switch(True)
+    time.sleep(0.6)
+    assert b.auto_on is True, "B 应镜像为开"
+    assert '"auto_switch": true' in open(b.cfg_path).read(), "B 应落盘为 true"
+
+
+def test_b_off_mirrors_to_a(pair):
+    a, b = pair
+    b.set_auto_switch(False)
+    time.sleep(0.6)
+    assert a.auto_on is False, "A 应镜像为关"
+    assert '"auto_switch": false' in open(a.cfg_path).read(), "A 应落盘为 false"
+
+
+def test_same_value_no_echo(pair):
+    a, b = pair
+    a.set_auto_switch(True)
+    time.sleep(0.6)
+    b.set_auto_switch(True)  # 值相同，_on_config_sync 应直接 return
+    time.sleep(0.6)
+    assert a.auto_on is True and b.auto_on is True, "两端应一致为开"
+
+
+def test_wrong_token_ignored(pair):
+    a, b = pair
+    a.token = "wrong-token"
+    a.cfg["token"] = "wrong-token"
+    before = b.auto_on
+    a.set_auto_switch(False)
+    time.sleep(0.6)
+    assert b.auto_on == before, "错误 token 的报文不应改变 B"
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

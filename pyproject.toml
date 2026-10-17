@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["selftest"]
+addopts = "-ra"
+# 集成测试会起真实 UDP 线程，单条稍慢；给足超时避免误判。
+timeout = 30
