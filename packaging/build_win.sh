@@ -13,17 +13,29 @@
 # 产物：
 #   dist/display-kvm.exe          主程序（托盘常驻，无控制台窗口）
 #   dist/display-kvm-ctl.exe      控制台客户端（绑热键用）
-#   dist/installer/Display-KVM-Setup-1.0.12.exe   安装包（若装了 Inno Setup）
+#   dist/installer/Display-KVM-Setup-<版本>.exe   安装包（若装了 Inno Setup）
 
 set -euo pipefail
 
-VERSION="1.0.12"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[警告]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- 版本号
+# 单一来源：仓库根的 VERSION 文件（可用 KVM_VERSION 环境变量覆盖）。
+# 以前这里是硬编码，发版时漏改就会打出「tag 是 1.0.13、安装包却叫 1.0.12」的产物。
+VERSION="${KVM_VERSION:-$(tr -d '[:space:]' < VERSION 2>/dev/null || true)}"
+[ -n "$VERSION" ] || die "读不到版本号：根目录的 VERSION 文件为空或不存在。"
+
+TAG="$(git describe --tags --exact-match 2>/dev/null || true)"
+if [ -n "$TAG" ] && [ "v$VERSION" != "$TAG" ]; then
+    die "版本不一致：git tag 是 $TAG，但 VERSION 文件写的是 $VERSION。"
+fi
+export KVM_VERSION="$VERSION"
+echo "版本: $VERSION"
 
 # ---------------------------------------------------------------- 找 Python
 
@@ -72,6 +84,32 @@ done
 say "生成图标"
 "$VENV_PY" packaging/make_icons.py
 
+# ---------------------------------------------------------------- 版本资源
+# version_info.txt 是 PyInstaller 的 --version-file，版本号由这里按 VERSION 就地
+# 重写一遍：它没法从环境变量取值，之前只能手工改，一忘就是「exe 属性里还是旧版本」。
+say "同步 Windows 版本资源 -> $VERSION"
+"$VENV_PY" - "$VERSION" <<'PY'
+import pathlib
+import re
+import sys
+
+version = sys.argv[1]
+nums = [int(p) for p in re.findall(r"\d+", version)][:4]
+nums += [0] * (4 - len(nums))
+fours = "(%d, %d, %d, %d)" % tuple(nums)
+
+p = pathlib.Path("packaging/version_info.txt")
+s = p.read_text(encoding="utf-8")
+s = re.sub(r"filevers=\([^)]*\)", "filevers=" + fours, s)
+s = re.sub(r"prodvers=\([^)]*\)", "prodvers=" + fours, s)
+s = re.sub(r'StringStruct\("FileVersion", "[^"]*"\)',
+           'StringStruct("FileVersion", "%s")' % version, s)
+s = re.sub(r'StringStruct\("ProductVersion", "[^"]*"\)',
+           'StringStruct("ProductVersion", "%s")' % version, s)
+p.write_text(s, encoding="utf-8")
+print(p.read_text(encoding="utf-8").count(version), "处版本号已写入", p)
+PY
+
 # ---------------------------------------------------------------- exe
 
 say "PyInstaller 构建 exe"
@@ -102,7 +140,8 @@ fi
 
 if [ -n "$ISCC" ]; then
     say "编译安装包"
-    "$ISCC" packaging/installer.iss
+    # 版本号从命令行注入，installer.iss 里只留 #ifndef 兜底，不必手工维护。
+    "$ISCC" "/DMyAppVersion=$VERSION" packaging/installer.iss
 else
     warn "没找到 Inno Setup，跳过安装包（手动装：winget install JRSoftware.InnoSetup）"
 fi

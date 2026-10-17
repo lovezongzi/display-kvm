@@ -11,22 +11,35 @@
 #
 # 产物：
 #   dist/Display KVM.app
-#   dist/Display-KVM-1.0.12.dmg
+#   dist/Display-KVM-<版本>.dmg（版本来自仓库根的 VERSION）
 
 set -euo pipefail
 
-VERSION="1.0.12"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m[警告]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- 版本号
+# 单一来源：仓库根的 VERSION 文件（可用 KVM_VERSION 环境变量覆盖）。
+# 以前这里硬编码 "1.0.12"，发版时漏改就会打出「tag 是 1.0.13、dmg 却叫 1.0.12」的产物。
+VERSION="${KVM_VERSION:-$(tr -d '[:space:]' < VERSION 2>/dev/null || true)}"
+[ -n "$VERSION" ] || die "读不到版本号：根目录的 VERSION 文件为空或不存在。"
+
+# 在带 tag 的提交上构建时强校验一次：tag 与 VERSION 不一致直接失败，
+# 免得又产出「版本对不上」的包（CI 就是靠这条兜住）。
+TAG="$(git describe --tags --exact-match 2>/dev/null || true)"
+if [ -n "$TAG" ] && [ "v$VERSION" != "$TAG" ]; then
+    die "版本不一致：git tag 是 $TAG，但 VERSION 文件写的是 $VERSION。"
+fi
+echo "版本: $VERSION"
 
 APP_NAME="Display KVM"
 APP_BUNDLE="dist/${APP_NAME}.app"
 DMG="dist/Display-KVM-${VERSION}.dmg"
 PY=".venv-build/bin/python"
-
-say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33m[警告]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 环境检查
 

@@ -465,6 +465,16 @@ Windows 上请在 Git Bash 里跑。
 
 - `filevers` / `prodvers` 修正为跟随实际版本（之前只改了字符串，元组还停在 1.0.11）。
 
+**构建：版本号改成单一来源**
+
+- 之前版本号散在 5 个地方（`build_mac.sh`、`build_win.sh`、`installer.iss`、
+  `display-kvm-mac.spec`、`version_info.txt`），发版时漏改就出现「tag 是 1.0.13、
+  产物却叫 1.0.12」这种事（本版第一轮构建就踩了）。
+- 现在只认仓库根的 `VERSION` 文件：两个构建脚本读它（`KVM_VERSION` 可覆盖），
+  mac spec 从它取 `CFBundleShortVersionString`，`installer.iss` 用
+  `/DMyAppVersion=` 注入，`version_info.txt` 由 `build_win.sh` 就地重写。
+- 且在带 tag 的提交上构建时，tag 与 `VERSION` 不一致会**直接失败**，不再默默出错包。
+
 ### v1.0.12
 
 **新增：自动切换状态两端网络同步**

@@ -11,6 +11,11 @@ from pathlib import Path
 
 HERE = Path(SPECPATH).parent  # noqa: F821
 
+# 版本号单一来源：仓库根的 VERSION 文件（KVM_VERSION 可覆盖）。
+# 以前这里写死 "1.0.12"，发版时漏改就会让 app 的 Info.plist 停在旧版本。
+VERSION = (os.environ.get("KVM_VERSION")
+           or (HERE / "VERSION").read_text().strip())
+
 datas = [(str(HERE / "packaging" / "assets" / "icon.png"), "assets")]
 
 # 构建脚本会把 m1ddc 二进制拷到 packaging/m1ddc，存在则一并打包
@@ -83,8 +88,8 @@ app = BUNDLE(
         "CFBundleName": "Display KVM",
         "CFBundleDisplayName": "Display KVM",
         "CFBundleIdentifier": "cn.displaykvm.agent",
-        "CFBundleShortVersionString": "1.0.13",
-        "CFBundleVersion": "1.0.13",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSHighResolutionCapable": True,
         # 菜单栏应用：不占 Dock、不弹窗口
         "LSUIElement": True,
