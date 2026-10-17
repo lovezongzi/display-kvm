@@ -43,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import platforms  # noqa: E402
+from kvm_platform import create, input_source_name  # noqa: E402
 
 DEFAULT_CONFIG: dict = {
     # 身份
@@ -207,7 +207,7 @@ class Agent:
         self.my_src = _src(cfg["my_input_source"])
         self.peer_src = _src(cfg["peer_input_source"])
 
-        self.platform = platforms.create(cfg, force=args.platform, strict=args.platform is None)
+        self.platform = create(cfg, force=args.platform, strict=args.platform is None)
 
         self.role = "unknown"  # active | idle
         self.armed = False
@@ -937,8 +937,8 @@ class Agent:
             "peer_age_seconds": (time.time() - self.peer_last_seen) if self.peer_last_seen else None,
             "my_input_source": "0x%02X" % self.my_src,
             "peer_input_source": "0x%02X" % self.peer_src,
-            "my_input_source_name": platforms.input_source_name(self.my_src),
-            "peer_input_source_name": platforms.input_source_name(self.peer_src),
+            "my_input_source_name": input_source_name(self.my_src),
+            "peer_input_source_name": input_source_name(self.peer_src),
         }
 
     def _handle_command(self, line: str) -> dict:
@@ -1079,7 +1079,7 @@ class Agent:
           2. 答"不是本机"就切到下一个候选再问，直到确认。
         只有在没有交互手段时（headless），才退回慢速的活口探测。
         """
-        name = platforms.input_source_name
+        name = input_source_name
         self.probing = True
         try:
             if self.cfg["dry_run"]:
@@ -1251,7 +1251,7 @@ def main(argv: list[str]) -> int:
     cfg = load_config(args.config)
 
     if args.status:
-        plat = platforms.create(cfg, force=args.platform, strict=args.platform is None)
+        plat = create(cfg, force=args.platform, strict=args.platform is None)
         present = plat.target_display_present()
         print(
             json.dumps(

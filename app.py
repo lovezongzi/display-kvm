@@ -529,9 +529,9 @@ def make_ask_user():
 
     def _ask(v: int) -> str:
         try:
-            import platforms
+            from kvm_platform import input_source_name
 
-            label = platforms.input_source_name(v)
+            label = input_source_name(v)
         except Exception:  # noqa: BLE001
             label = "0x%02X" % v
         buttons = ["本机 Mac", "另一台机器", "无信号"]
