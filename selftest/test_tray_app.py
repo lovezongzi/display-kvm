@@ -259,3 +259,111 @@ def test_run_registers_agent_callbacks(fake_pystray, monkeypatch):
     assert callable(getattr(agent, "on_paired", None))
     assert callable(getattr(agent, "on_discovered", None))
     assert callable(getattr(agent, "on_auto_sync", None))
+
+
+# ------------------------------------------------- Windows 右键菜单高亮不消失
+#
+# pystray 的 win32 后端是"快照式"的：update_menu() 会 DestroyMenu 再重建，
+# 而弹出菜单是 TrackPopupMenuEx 阻塞显示的。以前刷新线程每 2 秒硬重建一次，
+# 一旦砸在菜单打开期间，Windows 就在照着已释放的结构画菜单 —— 悬停高亮消失
+# （但还能点）。下面几条守住"显示期间绝不重建 + 弹出前重建"。
+
+
+def test_windows_never_rebuilds_while_menu_open(fake_pystray, monkeypatch):
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    app, agent, icon, cfg = _make()
+    app._menu_open = True
+
+    before = icon.menu_updates
+    app.update_menu()  # 模拟后台刷新线程在菜单打开期间刷新
+
+    assert icon.menu_updates == before, "菜单显示期间重建 = 高亮消失"
+    assert app._menu_dirty is True, "刷新应被记成脏标记，等关闭后补上"
+
+
+def test_windows_hook_rebuilds_before_popup_and_flushes_after_close(
+    fake_pystray, monkeypatch
+):
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    app, agent, icon, cfg = _make()
+    seen = {}
+
+    def _on_notify(wparam, lparam):
+        # 进到这里说明菜单要弹了：此刻必须已经重建过，且已标记为打开
+        seen["updates_at_popup"] = icon.menu_updates
+        seen["open"] = app._menu_open
+        app.update_menu()  # 模拟菜单项动作里的刷新（显示期间）
+        return 0
+
+    # 键名无所谓，钩子是靠处理函数的名字 "_on_notify" 找到槽位的（和 pystray 一致）
+    icon._message_handlers = {0x0400: _on_notify}
+    app._install_win_menu_hook(icon)
+    assert app._win_menu_hooked is True
+
+    before = icon.menu_updates
+    icon._message_handlers[0x0400](1, 0x0205)  # WM_RBUTTONUP
+
+    assert seen["updates_at_popup"] == before + 1, "弹出前必须先重建一次"
+    assert seen["open"] is True
+    assert app._menu_open is False, "菜单关闭后标记必须复位"
+    assert app._menu_dirty is False
+    assert icon.menu_updates == before + 2, "关闭后要补一次显示期间的刷新"
+
+
+def test_windows_hook_passes_through_other_messages(fake_pystray, monkeypatch):
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    app, agent, icon, cfg = _make()
+    hits = []
+    icon._message_handlers = {0x0400: lambda w, l: hits.append(l) or 0}
+    app._install_win_menu_hook(icon)
+
+    before = icon.menu_updates
+    icon._message_handlers[0x0400](0, 0x0202)  # WM_LBUTTONUP，不该触发重建
+
+    assert hits == [0x0202]
+    assert icon.menu_updates == before
+    assert app._menu_open is False
+
+
+def test_windows_hook_never_rebuilds_on_reentry(fake_pystray, monkeypatch):
+    """菜单还开着又来一次右键：不许重建（否则又把正在显示的菜单毁了）。"""
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    app, agent, icon, cfg = _make()
+    hits = []
+    icon._message_handlers = {0x0400: lambda w, l: hits.append(l) or 0}
+    app._install_win_menu_hook(icon)
+    app._menu_open = True
+
+    before = icon.menu_updates
+    icon._message_handlers[0x0400](1, 0x0205)
+
+    assert hits == [0x0205]  # 仍然交给 pystray 处理
+    assert icon.menu_updates == before
+
+
+def test_windows_hook_without_internals_is_safe(fake_pystray, monkeypatch):
+    """pystray 换了内部结构也不能崩，只是退回定时重建的老行为。"""
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    app, agent, icon, cfg = _make()
+    app._install_win_menu_hook(icon)  # 桩对象没有 _message_handlers
+    assert app._win_menu_hooked is False
+    # 老路径仍可用
+    before = icon.menu_updates
+    app.update_menu()
+    assert icon.menu_updates == before + 1
+
+
+def test_windows_periodic_refresh_only_touches_title_when_hooked(
+    fake_pystray, monkeypatch
+):
+    monkeypatch.setattr(tray_mod, "IS_WIN", True)
+    monkeypatch.setattr(tray_mod, "tray_image", lambda role="": None)
+    app, agent, icon, cfg = _make()
+    app._win_menu_hooked = True
+
+    before = icon.menu_updates
+    app._apply_state(icon)
+
+    assert icon.title.startswith(tray_mod.APP_TITLE)  # 标题照常刷新
+    assert icon.menu_updates == before, "菜单留到下次弹出前再重建"
+

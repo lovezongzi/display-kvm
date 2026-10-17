@@ -20,7 +20,15 @@ import time
 
 # 必须先导入 .paths：它在 import 时把项目根塞进 sys.path，后面的
 # `import hotkeys` / `import settings` 才找得到（它们不是本包的一部分）。
-from .paths import APP_NAME, APP_TITLE, CONFIG_PATH, IS_MAC, LOG_PATH, resource_path
+from .paths import (
+    APP_NAME,
+    APP_TITLE,
+    CONFIG_PATH,
+    IS_MAC,
+    IS_WIN,
+    LOG_PATH,
+    resource_path,
+)
 
 import hotkeys  # noqa: E402
 import settings  # noqa: E402
@@ -101,6 +109,12 @@ class TrayApp:
         self.cfg = cfg
         self.icon = None
 
+        # Windows 专用：右键菜单是否正在被显示、以及期间是否有待生效的刷新。
+        # 这两个标志的含义见 _rebuild_menu / _install_win_menu_hook。
+        self._menu_open = False
+        self._menu_dirty = False
+        self._win_menu_hooked = False
+
         # 注意：Menu(...) 构造时就会调用 line_* 这些回调取文本，此时 refresh() 还没跑过。
         # 所以这里必须把回调会读到的键全部初始化，否则第一次取文本就 KeyError
         # —— 在打包后的 app 里这会表现为启动即 SIGABRT（刷新 stdout 失败 -> 致命错误）。
@@ -150,9 +164,36 @@ class TrayApp:
         的 autorelease pool pop，即 objc_release 访问已释放对象）。统一走 _ui_call
         —— macOS 上经 AppHelper.callAfter 投递回主线程下一轮 run loop，此时没有
         任何菜单追踪会话，重建安全。
+
+        Windows 上还有第二个坑：pystray 的 win32 后端是"快照式"的 ——
+        update_menu() 先 DestroyMenu 再 CreatePopupMenu，而弹出菜单是
+        TrackPopupMenuEx 在消息循环线程里阻塞显示的。俩撞一起就是"菜单还开着，
+        它正在显示的那个 HMENU 被销毁重建了"，见 _rebuild_menu。
         """
         self.refresh()
-        self.icon.update_menu()
+        self._rebuild_menu()
+
+    def _rebuild_menu(self) -> None:
+        """真正重建菜单，但在 Windows 上避开"菜单正在显示"的时刻。
+
+        为什么不能一边显示一边重建：TrackPopupMenuEx 拿的是弹出那一刻的 HMENU
+        和 callbacks 列表。若在显示期间 DestroyMenu 掉它，Windows 还在照着已经
+        释放的结构画菜单 —— 表现就是**鼠标悬停不再高亮**（仍能点击），顺带还能
+        让点击落到错误的菜单项上（返回的序号按新菜单的 callbacks 去查）。
+
+        所以显示期间只记一个脏标记，等菜单关掉再重建；"关掉"的时机由
+        _install_win_menu_hook 提供（TrackPopupMenuEx 是模态的，返回即已关闭）。
+        """
+        icon = self.icon
+        if icon is None:
+            return
+        if IS_WIN and self._menu_open:
+            self._menu_dirty = True
+            return
+        try:
+            icon.update_menu()
+        except Exception as exc:  # noqa: BLE001
+            print("[tray] 重建菜单失败: %s" % exc)
 
     def role_label(self, role: str) -> str:
         # 彩色圆点 emoji。菜单栏图标可能被系统当 template 渲染成黑白
@@ -333,14 +374,14 @@ class TrayApp:
         def ui():
             self._notify(msg)
             self.refresh()
-            self.icon.update_menu()
+            self._rebuild_menu()
 
         self._ui_call(ui)
 
     def on_discovered(self, who, ip):
         def ui():
             self.refresh()
-            self.icon.update_menu()
+            self._rebuild_menu()
 
         self._ui_call(ui)
 
@@ -352,7 +393,7 @@ class TrayApp:
         def ui():
             self._notify("自动切换已按对端同步为%s" % ("开启" if on else "关闭"))
             self.refresh()
-            self.icon.update_menu()
+            self._rebuild_menu()
 
         self._ui_call(ui)
 
@@ -447,6 +488,64 @@ class TrayApp:
 
     # ------------------------------------------------------------------ 运行
 
+    def _install_win_menu_hook(self, ic) -> None:
+        """Windows：接管"右键弹出菜单"这个动作，改成「弹出前重建一次」。
+
+        pystray 的 win32 后端在 WM_RBUTTONUP 处理里调 TrackPopupMenuEx —— 这是个
+        模态调用，会一直阻塞到菜单关闭才返回。正好拿它当两个信号用：
+
+          * 进入时菜单还没弹出来，此刻重建菜单绝对安全，于是弹出的永远是最新状态；
+          * 返回时菜单一定已经关掉，可以把显示期间攒下的脏标记补一次重建。
+
+        这样刷新时机就从"每 2 秒硬重建一次（且可能砸在菜单打开期间）"变成
+        "每次打开前重建一次"，显示期间再没有任何 DestroyMenu。
+
+        这里碰的是 pystray 的私有结构 _message_handlers（_dispatcher 就是这么调
+        的：icon._message_handlers[uMsg](wParam, lParam)）。挂不上就返回，
+        调用方仍然走原来的定时重建，行为退回到修复前，不会崩。
+        """
+        handlers = getattr(ic, "_message_handlers", None)
+        if not isinstance(handlers, dict):
+            return
+        key = None
+        for k, fn in handlers.items():
+            # 按函数名找 WM_NOTIFY 的槽位，避免依赖 pystray 内部的常量数值
+            if getattr(fn, "__name__", "") == "_on_notify":
+                key = k
+                break
+        if key is None:
+            return
+
+        orig = handlers[key]
+        app = self
+        wm_rbuttonup = 0x0205  # WM_RBUTTONUP，Win32 固定值
+
+        def on_notify(wparam, lparam):
+            if lparam != wm_rbuttonup:
+                return orig(wparam, lparam)
+            if app._menu_open:
+                # 重入（上一个菜单还没关又来了右键）：绝对不能再重建，
+                # 否则又要销毁正在显示的那个 HMENU —— 直接交给原来那层。
+                return orig(wparam, lparam)
+            try:
+                app.update_menu()  # 菜单还没弹，此刻重建安全，弹出即最新
+            except Exception:  # noqa: BLE001
+                pass
+            app._menu_open = True
+            try:
+                return orig(wparam, lparam)  # 一直阻塞到菜单关闭
+            finally:
+                app._menu_open = False
+                if app._menu_dirty:
+                    app._menu_dirty = False
+                    try:
+                        app.update_menu()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        handlers[key] = on_notify
+        self._win_menu_hooked = True
+
     def _ui_call(self, fn, *a) -> None:
         """把 AppKit 调用投递回主线程。
 
@@ -487,14 +586,18 @@ class TrayApp:
                 ic.icon = tray_image(role)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            ic.update_menu()
-        except Exception:  # noqa: BLE001
-            pass
+        # 这里不能直接 ic.update_menu()：Windows 上菜单可能正被显示，
+        # 重建会砸掉正在显示的那个 HMENU（高亮消失）。统一走带守卫的版本。
+        # 装了"打开前重建"钩子之后，定时重建就纯属多余 —— 菜单每次弹出前都会
+        # 重建，这里只更新图标和标题就够，省掉反复 DestroyMenu/CreatePopupMenu。
+        if not (IS_WIN and self._win_menu_hooked):
+            self._rebuild_menu()
 
     def _on_setup(self, ic) -> None:
         self.icon = ic
         ic.visible = True
+        if IS_WIN:
+            self._install_win_menu_hook(ic)
         threading.Thread(target=self.agent.run, name="agent", daemon=True).start()
         self.rebind_hotkeys()
 
