@@ -437,6 +437,34 @@ Windows 上请在 Git Bash 里跑。
 
 ## 十、更新日志
 
+### v1.0.13
+
+**重构：把三个上帝文件拆成有边界的包**（功能与配置格式完全兼容，升级不用改任何设置）
+
+- `platforms.py`（约 800 行）→ `kvm_platform/`：`constants.py`（VCP 表 / 输入源命名）、
+  `base.py`（`PlatformBase`）、`windows.py`、`mac.py`，`create()` 工厂保留原公开 API。
+  包名故意不叫 `platform` —— 那样会遮蔽标准库。
+- `agent.py`（1275 行）→ `kvm_core/` 领域模块：`config` / `common` / `transport` /
+  `pairing` / `sync` / `discovery` / `switch` / `control` / `probe`。
+  `Agent` 只剩 `__init__`（建 socket、共享字段）、`run` 与对外 facade，302 行。
+- `app.py`（1180 行）→ `kvm_app/`：`paths` / `logsetup` / `config_store` / `autostart` /
+  `dialogs` / `tray`（把原来的层层闭包收成 `TrayApp` 类）/ `entry`。`app.py` 只做门面，134 行。
+- 建立 `selftest/` 测试安全网（pytest，30 个用例）：配对协议、自动切换同步、配置归一化、
+  托盘菜单重建。重构期间靠它保证行为不变。
+- PyInstaller spec 的 `hiddenimports` 同步到新包名，否则打包后会缺模块。
+
+**修复：Windows 托盘右键菜单滑几次后不再高亮**
+
+- 根因是托盘图标那套 2 秒定时 `update_menu()`：`pystray` 的 win32 后端是快照式菜单
+  （`DestroyMenu` + `CreatePopupMenu` 重建），而 `TrackPopupMenuEx` 在消息循环线程里阻塞显示，
+  重建正好落在菜单显示期间 → 菜单项变成没有 id 的死项，能点但不再高亮。
+- 改法：菜单显示期间只置脏标记、绝不重建；在 `WM_RBUTTONUP` 弹出之前重建一次，
+  弹出返回后再补一次脏刷新。图标与标题仍按 2 秒刷新，但那部分不碰 HMENU。
+
+**Windows 版本资源**
+
+- `filevers` / `prodvers` 修正为跟随实际版本（之前只改了字符串，元组还停在 1.0.11）。
+
 ### v1.0.12
 
 **新增：自动切换状态两端网络同步**
