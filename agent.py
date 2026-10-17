@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import secrets
 import socket
 import sys
 import threading
@@ -51,6 +52,7 @@ DEFAULT_CONFIG: dict = {
     "peer_name": "mac",
     "peer_ip": "",  # 留空则靠 UDP 广播自动发现
     "token": "change-me",
+    "paired": False,  # 是否已通过局域网配对（配对后不再接受新配对，防被劫持）
     # 端口（peer_udp_port 留 0 表示与 udp_port 相同；同机双实例自测时可分开设）
     "udp_port": 47821,
     "peer_udp_port": 0,
@@ -119,6 +121,13 @@ class Agent:
 
         self.name = cfg["name"]
         self.token = str(cfg["token"])
+        self.paired = bool(cfg.get("paired", False))
+        self._offered_nonce = None  # 发起配对时本机的临时 nonce（收到对应 accept 才清）
+        self._offered_token = None  # 发起配对时生成的共享 token
+        self._session_nonce = secrets.token_hex(4)  # 本次运行的 announce 标识
+        self.pair_candidates = {}  # ip -> 对端名（未配对候选，供托盘显示）
+        self.on_paired = None       # (ok: bool, peer: str, msg: str) -> None
+        self.on_discovered = None   # (name: str, ip: str) -> None
         self.my_src = _src(cfg["my_input_source"])
         self.peer_src = _src(cfg["peer_input_source"])
 
@@ -181,6 +190,12 @@ class Agent:
             self._send(msg, "255.255.255.255")
 
     def _on_message(self, msg: dict, addr) -> None:
+        kind = msg.get("t")
+        # 配对消息先于 token 校验处理：未配对的两端要靠它协商出共享 token，
+        # 此时双方 token 还不一致，走普通校验会被直接丢弃。
+        if kind in ("pairing_announce", "pairing_offer", "pairing_accept"):
+            self._on_pairing(msg, addr)
+            return
         if msg.get("from") == self.name:
             return
         if str(msg.get("token")) != self.token:
@@ -217,6 +232,138 @@ class Agent:
 
         elif kind == "ack":
             log("对端确认：切换%s" % ("成功" if msg.get("ok") else "失败"))
+
+    # ------------------------------------------------------------------ 配对
+
+    def _send_raw(self, msg: dict, ip: str) -> None:
+        """不经 token 包装的原始发送（配对消息用，因为配对时双方 token 还不一致）。"""
+        try:
+            self.sock.sendto(json.dumps(msg).encode("utf-8"), (ip, self.peer_port))
+        except OSError as exc:
+            log("发送失败: %s" % exc)
+
+    def _fire_paired(self, ok: bool, peer: str, msg: str) -> None:
+        if callable(self.on_paired):
+            try:
+                self.on_paired(ok, peer, msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_pairing(self, msg: dict, addr) -> None:
+        """处理 announce / offer / accept。
+
+        安全性：配对只在「双方都未配对」时发生。已配对的一方会直接忽略
+        任何新的 announce / offer，因此没法用伪造的 offer 劫持一个已经配对好的对子
+        （最坏情况是同局域网里另一个未配对的实例来配对，这正是用户想要的）。
+        协商出的 token 在局域网里明文跑，家用无妨；公司/公共网络请勿用。
+        """
+        kind = msg.get("t")
+        who = msg.get("from")
+        if who == self.name:
+            return
+
+        if kind == "pairing_announce":
+            if self.paired:
+                return
+            self.pair_candidates[addr[0]] = who
+            if callable(self.on_discovered):
+                try:
+                    self.on_discovered(who, addr[0])
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        if kind == "pairing_offer":
+            if self.paired:
+                return  # 已配对：不接受新配对，防劫持
+            incoming = str(msg.get("token") or "")
+            if len(incoming) < 6:
+                return
+            # 双方同时点「配对」时按 from 名字大小定主导：名字大的一方维持自己的
+            # offer，名字小的一方采纳对方的 token（mac/windows 不会同名，必有胜负）。
+            if self._offered_nonce and who < self.name:
+                return
+            # 采纳对端发来的 token，写盘并回确认
+            self.token = incoming
+            self.cfg["token"] = incoming
+            self.paired = True
+            self._offered_nonce = None
+            self._save_cfg()
+            self._send_raw(
+                {"t": "pairing_accept", "from": self.name, "nonce": msg.get("nonce")},
+                addr[0],
+            )
+            log("已通过对端 %s 的配对，写入共享 token" % who)
+            self._fire_paired(True, who, "已与 %s 配对" % who)
+            return
+
+        if kind == "pairing_accept":
+            if not self._offered_nonce:
+                return
+            if str(msg.get("nonce")) != self._offered_nonce:
+                return
+            # 对端确认采纳了本机发出的 token
+            self.paired = True
+            self._save_cfg()
+            self._offered_nonce = None
+            who = msg.get("from")
+            log("配对成功：%s 已采纳本机共享 token" % who)
+            self._fire_paired(True, who, "已与 %s 配对" % who)
+            return
+
+    def start_pairing(self) -> None:
+        """发起局域网配对：生成共享 token 并广播，等未配对的对端采纳。"""
+
+        def blast() -> None:
+            # 目标：全子网广播 + 已发现的候选 IP + 已配置的 peer_ip。
+            # 不单独依赖广播（某些环境下 255.255.255.255 不可达，但点对点可达）。
+            targets = ["255.255.255.255"]
+            targets += [ip for ip in self.pair_candidates if ip]
+            if self.cfg.get("peer_ip"):
+                targets.append(self.cfg["peer_ip"])
+            offer = {
+                "t": "pairing_offer",
+                "from": self.name,
+                "token": self._offered_token,
+                "nonce": self._offered_nonce,
+            }
+            for _ in range(4):
+                if self.paired and self._offered_nonce is None:
+                    break
+                for ip in targets:
+                    self._send_raw(offer, ip)
+                time.sleep(0.8)
+            # 超时仍未被采纳（UDP 可能丢包 / 对端没收到）：本机已经用上这个新 token，
+            # 直接置为已配对。这样即便 accept 回包丢了，只要对端采纳了，两端 token 仍一致。
+            if self._offered_nonce is not None and not self.paired:
+                self.paired = True
+                self._save_cfg()
+                self._fire_paired(
+                    True, "", "已写入共享 token（未收到对端回包，请确认对端在线）"
+                )
+
+        if self.paired:
+            self.unpair()  # 已配对先解除，再重新协商
+        new_token = secrets.token_hex(8)
+        nonce = secrets.token_hex(4)
+        self.token = new_token
+        self.cfg["token"] = new_token
+        self._offered_token = new_token
+        self._offered_nonce = nonce
+        self.paired = False  # 等 accept 确认
+        self.pair_candidates.clear()
+        threading.Thread(target=blast, name="pair", daemon=True).start()
+        log("已开始局域网配对，等待对端采纳共享 token …")
+
+    def unpair(self) -> None:
+        """解除配对：换一个新随机 token 并恢复可被发现，便于重新配对。"""
+        self.token = secrets.token_hex(8)
+        self.cfg["token"] = self.token
+        self.paired = False
+        self._offered_nonce = None
+        self.pair_candidates.clear()
+        self._save_cfg()
+        log("已解除配对，恢复可被发现状态")
 
     def _udp_loop(self) -> None:
         while self.running:
@@ -437,6 +584,18 @@ class Agent:
             if now >= next_hello:
                 self._send_hello()
                 next_hello = now + float(self.cfg["hello_interval_seconds"])
+                # 未配对时顺便广播 announce，让对端托盘能发现「可配对设备」。
+                # 已配对后不再广播，避免被同局域网其他实例骚扰。
+                if not self.paired:
+                    self._send_raw(
+                        {
+                            "t": "pairing_announce",
+                            "from": self.name,
+                            "platform": self.platform.name,
+                            "nonce": self._session_nonce,
+                        },
+                        "255.255.255.255",
+                    )
 
             self._expire_peer(now)
 
@@ -463,6 +622,7 @@ class Agent:
             "peer_ip": self.peer_ip,
             "peer_role": self.peer_role,
             "peer_online": self.peer_online,
+            "paired": self.paired,
             "peer_age_seconds": (time.time() - self.peer_last_seen) if self.peer_last_seen else None,
             "my_input_source": "0x%02X" % self.my_src,
             "peer_input_source": "0x%02X" % self.peer_src,

@@ -5,6 +5,7 @@
 
   "peer_ip": "",
   "token": "和 Windows 端保持完全一致",
+  "paired": false,
 
   "udp_port": 47821,
   "control_port": 47822,

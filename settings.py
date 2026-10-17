@@ -164,27 +164,50 @@ def _diff(cfg: dict, answers: dict) -> dict:
 
 
 FALLBACK = "__fallback__"  # 原生窗口弹不出时返回这个，调用方据此打开配置文件
-OPENED = "__opened__"  # 已废弃（v1.0.5 起 macOS 走同步模态窗口，不再使用）
+
+# 非模态窗口单例：防止「点一次后打不开第二次」，并把已开窗口提到最前。
+#
+# 必须**持有** win/ctl 的 Python 引用（不能退化成只记 bool 标志）：
+#   PyObjC 的 NSObject 子类实例若只被 ObjC 侧（按钮 target）持有、Python 侧没有
+#   引用，它的 Python __dict__ 会被 GC 回收，导致 ctl._win / ctl._read 丢失，
+#   点「保存/取消」时 close() 压根不会执行 -> **窗口不消失**（实测现象）。
+#
+# 但绝不能在 windowWillClose_ 里**同步**清除这些引用：
+#   那会让 Python 在 AppKit 关闭流程进行中释放 win，与 AppKit 竞争 -> 悬垂
+#   -> 下一轮 run loop 的 autorelease pool drain 时 objc_release EXC_BAD_ACCESS
+#   （即"保存后退出"崩溃）。
+#
+# 也不能用 weakref：PyObjC 对象不支持弱引用（实测 TypeError: cannot create
+#   weak reference to 'NSWindow' object），一用就抛异常、被 except 吞掉后
+#   退化成 FALLBACK（弹出文本编辑器）。
+#
+# 正确做法只有一条：**持有引用，并把清除推迟到窗口完全关闭后的下一轮 run loop**。
+_OPEN = {"win": None, "ctl": None}
 
 
-def open_settings(cfg: dict, fallback=None):
+def open_settings(cfg: dict, fallback=None, on_save=None):
     """打开设置窗口（一个集中面板，填完点保存即时生效）。
 
+    参数：
+      * fallback —— 原生窗口弹不出来时调用（通常用来打开配置文件）。
+      * on_save  —— 用户点「保存」且确有改动后回调，签名 on_save(changed: dict)。
+                   传了 on_save 时，保存结果通过该回调异步交付，本函数返回 None
+                   （macOS 非模态窗口本身就是异步的；Windows 会同步算好 diff 后调用）。
+
     返回：
-      * dict     —— 被改动的字段（用户保存了且确有改动）
-      * None     —— 用户取消 / 没改动
+      * dict     —— 被改动的字段（仅在不传 on_save 且为同步路径时）
+      * None     —— 窗口已异步打开 / 用户取消 / 没改动
       * FALLBACK —— 原生窗口弹不出来（headless、显示服务异常等），已执行 fallback
 
-    macOS / Windows 都走原生同步窗口：窗口关闭后返回被改动的字段，
-    调用方负责写配置、同步 agent、刷新托盘。弹不出来时才走 fallback，
-    绝不再退化成「每个参数弹一次输入框」。
-
-    macOS 用 NSApp.runModalForWindow_ 模态弹出，并给窗口加 delegate 保证红叉关闭也
-    结束模态会话——否则红叉只关窗不结束模态，下一次再开会抛
-    “may not be invoked inside of a modal session”，被 except 吞掉后回退成打开 JSON。
+    重要（崩溃修复）：macOS 曾经用 NSApp.runModalForWindow_ 在 pystray 的运行循环里
+    再开一个嵌套模态会话，窗口对象会被 modal 会话的 autorelease pool 持有，又在
+    _form_mac 返回时被 Python 包装器 release 一次 → 双重释放 → 保存后 EXC_BAD_ACCESS。
+    现改为**非模态窗口 + 关闭回调**：窗口随普通按钮事件关闭，不存在嵌套模态，不再
+    双重释放。窗口关闭时调用 NSApp.deactivate() 让状态栏菜单恢复正常（否则会复现
+    v1.0.4 的「点一次后托盘打不开」）。
     """
     if IS_MAC:
-        r = _form_mac(cfg)
+        r = _form_mac(cfg, on_save)
         if r is FALLBACK:
             if callable(fallback):
                 try:
@@ -203,7 +226,11 @@ def open_settings(cfg: dict, fallback=None):
             return FALLBACK
         if not answers:
             return None
-        return _diff(cfg, answers) or None
+        diff = _diff(cfg, answers) or None
+        if callable(on_save) and diff:
+            on_save(diff)
+            return None
+        return diff
     # 非 mac/win 平台：没有原生窗口，直接走 fallback
     if callable(fallback):
         try:
@@ -219,17 +246,22 @@ def open_settings(cfg: dict, fallback=None):
 # ==========================================================================
 
 
-def _form_mac(cfg: dict):
-    """macOS 原生设置窗口（单窗口集中面板，模态弹出）。
+def _form_mac(cfg: dict, on_save=None):
+    """macOS 原生设置窗口（单窗口集中面板，**非模态**，关闭后通过回调交付结果）。
 
-    用 NSApp.runModalForWindow_ 以模态方式显示：菜单动作会一直阻塞到窗口关闭，
-    天然不会「叠多个窗口」，也不会在 NSApp 上留下挂起的模态会话。
+    为什么改成非模态：之前用 NSApp.runModalForWindow_ 在 pystray 的运行循环里再开
+    一个嵌套模态会话，窗口对象会被 modal 会话的 autorelease pool 持有，又在
+    _form_mac 返回时被 Python 包装器 release 一次 → 双重释放 → 点「保存」后
+    EXC_BAD_ACCESS 闪退。非模态窗口随普通按钮事件关闭，不存在嵌套模态，不再双重释放。
 
-    关键修复：给窗口加 delegate，红叉关闭也走 windowWillClose_ -> stopModal，
-    否则红叉只关窗不结束模态会话，下一次再开就会抛
-    “may not be invoked inside of a modal session”，被 except 吞掉后回退成打开 JSON。
+    行为：
+      * 已有一个打开的窗口时，只把它提到最前（避免打不开第二次 / 叠多个窗口）。
+      * 点「保存」：先读值（关窗前，转为 Python 原生值），关闭窗口，
+        再经 AppHelper.callAfter 把改动交给 on_save 回调（写配置 / 同步 agent / 刷新托盘）。
+      * 点「取消」或红叉：关闭窗口，不调用 on_save。
+      * 窗口关闭时调用 NSApp.deactivate() 让状态栏菜单恢复正常。
 
-    返回：被改动的字段字典 / 取消或没改动返回 None / 窗口弹不出来返回 FALLBACK。
+    返回：FALLBACK（窗口建不出来）/ None（已异步打开，结果走 on_save）。
     """
     try:
         import objc
@@ -250,6 +282,26 @@ def _form_mac(cfg: dict):
     except Exception:  # noqa: BLE001
         return FALLBACK
 
+    # 设置窗口**只创建一次，之后永久复用**：点关闭只是隐藏，再点设置就刷新
+    # 控件值后重新显示。这样 Python 侧永远不释放 NSWindow / ctl，也就彻底
+    # 不存在"Python 与 AppKit 抢着释放"导致的 EXC_BAD_ACCESS（"保存后退出"）。
+    existing = _OPEN["win"]
+    if existing is not None:
+        try:
+            refresh = _OPEN.get("refresh")
+            if callable(refresh):
+                refresh()
+            # 换上本次的保存回调（里头捕获的是当前 cfg/icon/agent）
+            ctl0 = _OPEN.get("ctl")
+            if ctl0 is not None:
+                ctl0._on_save = on_save
+                ctl0._answers = None
+            NSApp.activateIgnoringOtherApps_(True)
+            existing.makeKeyAndOrderFront_(None)
+        except Exception:  # noqa: BLE001
+            return FALLBACK
+        return None
+
     try:
         row_h = 62
         W = 560
@@ -262,6 +314,14 @@ def _form_mac(cfg: dict):
             NSBackingStoreBuffered,
             False,
         )
+        # 【关键】NSWindow 的 releasedWhenClosed 默认就是 YES —— 窗口一关闭，
+        # AppKit 会**自己把它 release 掉**。而 Python 侧（_OPEN / ctl._win）还
+        # 握着同一个对象的引用，于是在后续清理里 Python 释放 __dict__ 时会去
+        # objc_release 一个已被 AppKit 释放的地址 -> EXC_BAD_ACCESS（表现为
+        # "点保存/取消后程序退出"，崩溃栈落在 AppHelper.callAfter 回调里）。
+        # 关闭这个默认行为后，窗口的生命周期**完全由 Python 引用计数**决定，
+        # AppKit 不再插手释放，双重释放从根上消失。
+        win.setReleasedWhenClosed_(False)
         win.setTitle_("自动切换参数设置")
         win.center()
 
@@ -311,7 +371,7 @@ def _form_mac(cfg: dict):
 
         def read_answers():
             # 必须在窗口关闭【之前】调用：close() 会把窗口连同子控件一起释放，
-            # 之后再去读 c.state()/c.stringValue() 会访问已释放的 ObjC 对象 -> EXC_BAD_ACCESS。
+            # 之后再去读 c.state()/c.stringValue() 会访问已释放的 ObjC 对象。
             # 这里直接转成 Python 原生值（str / bool），彻底脱离 ObjC 对象生命周期。
             ans = {}
             for f in FIELDS:
@@ -319,30 +379,71 @@ def _form_mac(cfg: dict):
                 ans[f.key] = bool(c.state()) if f.kind == "bool" else str(c.stringValue())
             return ans
 
+        def apply_values():
+            # 窗口复用时把 cfg 的当前值刷回控件（用户可能在别处改过配置）。
+            for f in FIELDS:
+                c = controls[f.key]
+                v = cfg.get(f.key)
+                if f.kind == "bool":
+                    c.setState_(1 if v else 0)
+                else:
+                    c.setStringValue_(fmt(v if v is not None else ""))
+
         class _Ctl(NSObject):
+            # 持有窗口引用用于关窗。这份引用随 ctl 一起存在，而 ctl 被按钮
+            # target retain，所以它是在**关闭流程结束之后**才随 ctl 释放的，
+            # 不会与 AppKit 抢着释放窗口。
+            # 切勿在 windowWillClose_ 里把它置 None——那正是"保存后崩溃"的根因。
             def ok_(self, sender):  # noqa: ANN001
-                self._code = 1
-                self._answers = self._read()  # 关窗前先把值读出来
-                self._win.close()
+                self._answers = self._read()  # 关窗前先把值读成原生类型
+                w = self._win
+                if w is not None:
+                    w.close()
 
             def cancel_(self, sender):  # noqa: ANN001
-                self._code = 0
                 self._answers = None
-                self._win.close()
+                w = self._win
+                if w is not None:
+                    w.close()
 
             def windowShouldClose_(self, sender):  # noqa: ANN001
                 return True
 
             def windowWillClose_(self, notification):  # noqa: ANN001
-                # 无论是点「保存」「取消」还是红叉，窗口一关就结束模态会话，
-                # 保证下一次还能再开（否则红叉只关窗不结束模态，下次再开会崩）。
-                NSApp.stopModalWithCode_(self._code)
+                # 这里**绝不**同步清除 _OPEN：那会与 AppKit 抢着释放 win 而崩溃。
+                # 只记下要交付的结果，把「清引用 + 恢复菜单 + 保存回调」整体推迟。
+                cb = self._on_save
+                ans = self._answers
+
+                def do_close():
+                    # 【刻意不清理 _OPEN】窗口和 ctl 一旦创建就常驻，永不释放：
+                    # 任何一次 Python 侧释放都可能与 AppKit 的释放撞车，表现为
+                    # "点保存/取消后程序退出"（EXC_BAD_ACCESS）。既然窗口要复用，
+                    # 就干脆一次都不释放 —— 没有释放，就没有双重释放。
+                    # delegate 也因此永远有效，不存在悬垂。
+                    try:
+                        NSApp.deactivate()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if callable(cb) and ans is not None:
+                        try:
+                            cb(ans)
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                try:
+                    from PyObjCTools import AppHelper
+
+                    AppHelper.callAfter(do_close)
+                except Exception:  # noqa: BLE001
+                    do_close()
 
         ctl = _Ctl.alloc().init()
+        # 持有窗口以便关窗（释放时机见 _Ctl 注释：随 ctl 释放，不在关闭流程中）
         ctl._win = win
         ctl._read = read_answers
-        ctl._code = 0
         ctl._answers = None
+        ctl._on_save = on_save
 
         btn_ok = NSButton.alloc().initWithFrame_(NSMakeRect(W - 190, 20, 80, 30))
         btn_ok.setTitle_("保存")
@@ -362,12 +463,11 @@ def _form_mac(cfg: dict):
 
         NSApp.activateIgnoringOtherApps_(True)
         win.makeKeyAndOrderFront_(None)
-        rc = NSApp.runModalForWindow_(win)
-        win.orderOut_(None)
-
-        if rc != 1 or ctl._answers is None:
-            return None
-        return _diff(cfg, ctl._answers) or None
+        # 永久持有：窗口/委托/刷新函数一旦建立就不再释放（复用设计，见 _OPEN 注释）。
+        _OPEN["win"] = win
+        _OPEN["ctl"] = ctl
+        _OPEN["refresh"] = apply_values
+        return None
     except Exception:  # noqa: BLE001
         return FALLBACK
 
@@ -380,7 +480,7 @@ _PS_FORM = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$fields = Get-Content -Raw -Path '%(json)s' | ConvertFrom-Json
+$fields = Get-Content -Raw -Encoding utf8 -Path '%(json)s' | ConvertFrom-Json
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '自动切换参数设置'
@@ -479,11 +579,11 @@ def _form_win(cfg: dict) -> dict | None:
 
     # 字段用临时文件传，避免中文和引号在命令行里被转义搞坏
     tmp = Path(tempfile.gettempdir()) / "display-kvm-settings.json"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8-sig")
     ps = ps.replace("'%(json)s'", "'%s'" % str(tmp).replace("\\", "\\\\").replace("'", "''"))
 
     script = Path(tempfile.gettempdir()) / "display-kvm-settings.ps1"
-    script.write_text(ps, encoding="utf-8")
+    script.write_text(ps, encoding="utf-8-sig")
 
     try:
         p = subprocess.run(

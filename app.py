@@ -178,6 +178,7 @@ def build_default_config() -> dict:
         "peer_name": "mac" if IS_WIN else "windows",
         "peer_ip": "",
         "token": secrets.token_hex(8),
+        "paired": False,
         "udp_port": 47821,
         "peer_udp_port": 0,
         "control_port": 47822,
@@ -645,6 +646,7 @@ def run_tray(agent, cfg: dict) -> int:
         "peer_role": "unknown",
         "peer_age": None,
         "auto": agent.auto_on,
+        "paired": agent.paired,
     }
 
     def refresh() -> None:
@@ -657,8 +659,22 @@ def run_tray(agent, cfg: dict) -> int:
             state["peer_role"] = r.get("peer_role") or "unknown"
             state["peer_age"] = r.get("peer_age_seconds")
             state["auto"] = bool(r.get("auto"))
+            state["paired"] = bool(r.get("paired"))
         except Exception as exc:  # noqa: BLE001
             state["detail"] = "状态读取失败: %s" % exc
+
+    def _update_menu() -> None:
+        """刷新状态并重建托盘菜单。
+
+        必须「推迟到当前菜单会话结束之后」再执行：在菜单动作回调里同步调用
+        icon.update_menu() 会令 AppKit 释放正在被追踪的 NSMenuItem，表现为
+        EXC_BAD_ACCESS（崩溃在 -[NSStatusItem _beginExpandedInterfaceSession:]
+        的 autorelease pool pop，即 objc_release 访问已释放对象）。统一走 _ui_call
+        —— macOS 上经 AppHelper.callAfter 投递回主线程下一轮 run loop，此时没有
+        任何菜单追踪会话，重建安全。
+        """
+        refresh()
+        icon.update_menu()
 
     def role_label(role: str) -> str:
         # 彩色圆点 emoji。菜单栏图标可能被系统当 template 渲染成黑白
@@ -687,6 +703,15 @@ def run_tray(agent, cfg: dict) -> int:
             return "%s · 未发现" % who
         return "%s · 离线" % who
 
+    def line_pair(item=None):
+        if state.get("paired"):
+            return "配对状态 · 已配对"
+        cands = getattr(agent, "pair_candidates", {})
+        if cands:
+            names = "、".join(dict.fromkeys(cands.values()))
+            return "配对状态 · 发现可配对设备：%s" % names
+        return "配对状态 · 未配对（点「配对两端」自动协商）"
+
     def do_switch(icon, item):
         r = agent.api_switch("托盘手动切换")
         msg = {
@@ -697,8 +722,7 @@ def run_tray(agent, cfg: dict) -> int:
             "pending": "已提交，稍后生效",
         }.get(r, r)
         _notify(icon, APP_TITLE, msg)
-        refresh()
-        icon.update_menu()
+        _ui_call(_update_menu)
 
     def do_switch_peer(icon, item):
         r = agent.api_switch_peer("托盘手动切换")
@@ -710,8 +734,7 @@ def run_tray(agent, cfg: dict) -> int:
             "pending": "已提交，稍后生效",
         }.get(r, r)
         _notify(icon, APP_TITLE, msg)
-        refresh()
-        icon.update_menu()
+        _ui_call(_update_menu)
 
     def do_autodetect(icon, item):
         _notify(icon, APP_TITLE, "开始探测输入口，画面会切换几次")
@@ -805,47 +828,77 @@ def run_tray(agent, cfg: dict) -> int:
         _save_cfg_fields({HK_FIELD[kind]: ans})
         rebind_hotkeys()
         _notify(icon, APP_TITLE, "「%s」：%s" % (HK_TITLE[kind], hk_label(kind)))
-        refresh()
-        icon.update_menu()
+        _ui_call(_update_menu)
 
     def toggle_hotkeys(icon, item) -> None:
         cfg["hotkeys_enabled"] = not cfg.get("hotkeys_enabled", True)
         _save_cfg_fields({"hotkeys_enabled": cfg["hotkeys_enabled"]})
         rebind_hotkeys()
         _notify(icon, APP_TITLE, "全局快捷键已%s" % ("开启" if cfg["hotkeys_enabled"] else "关闭"))
-        refresh()
-        icon.update_menu()
+        _ui_call(_update_menu)
 
     def toggle_auto(icon, item):
         agent.auto_on = not agent.auto_on
         _notify(icon, APP_TITLE, "自动切换已%s" % ("开启" if agent.auto_on else "关闭"))
-        refresh()
-        icon.update_menu()
+        _ui_call(_update_menu)
+
+    def do_pair(icon, item):
+        _notify(icon, APP_TITLE, "正在通过局域网配对，请确保对端也已运行 display-kvm …")
+        agent.start_pairing()
+        _ui_call(_update_menu)
+
+    def do_unpair(icon, item):
+        agent.unpair()
+        _notify(icon, APP_TITLE, "已解除配对，恢复可被发现")
+        _ui_call(_update_menu)
+
+    def _on_paired(ok, peer, msg):
+        # agent 的 UDP 线程回调，必须回到主线程刷新托盘（macOS 尤其）
+        def ui():
+            _notify(icon, APP_TITLE, msg)
+            refresh()
+            icon.update_menu()
+
+        _ui_call(ui)
+
+    def _on_discovered(who, ip):
+        def ui():
+            refresh()
+            icon.update_menu()
+
+        _ui_call(ui)
+
+    agent.on_paired = _on_paired
+    agent.on_discovered = _on_discovered
 
     def do_settings(icon, item) -> None:
         """打开参数设置窗口（一个集中面板，填完点保存即时生效）。
 
-        macOS / Windows 都走原生同步窗口：窗口关闭后返回被改动的字段，
-        这里统一写回 cfg / agent / 托盘。原生窗口弹不出来时，才打开配置文件兜底。
+        macOS 走**非模态**原生窗口：点「保存」后通过 on_save 回调异步交付改动，
+        这里统一写回 cfg / agent / 托盘。Windows 走 PowerShell 表单，同样经 on_save
+        交付。原生窗口弹不出来时，才打开配置文件兜底。
         """
-        res = settings.open_settings(cfg, fallback=lambda: open_in_system(CONFIG_PATH))
+
+        def on_save(changed: dict) -> None:
+            if not changed:
+                return
+            cfg.update(changed)
+            _save_cfg_fields(changed)
+            # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
+            # 否则要重启才生效。
+            agent.update_cfg(changed)
+            _notify(icon, APP_TITLE, "已保存：%s" % settings.summarize(changed))
+            _ui_call(_update_menu)
+
+        res = settings.open_settings(
+            cfg, fallback=lambda: open_in_system(CONFIG_PATH), on_save=on_save
+        )
         if res == settings.FALLBACK:
             _notify(
                 icon,
                 APP_TITLE,
                 "设置窗口打不开，已打开配置文件，改完保存后重启程序生效",
             )
-            return
-        if not res:
-            return  # 用户取消 / 没改动
-        cfg.update(res)
-        _save_cfg_fields(res)
-        # 主循环读的是 agent 自己那份 cfg（构造时拷贝过的），必须同步过去，
-        # 否则要重启才生效。
-        agent.update_cfg(res)
-        _notify(icon, APP_TITLE, "已保存：%s" % settings.summarize(res))
-        refresh()
-        icon.update_menu()
 
     def open_cfg(icon, item):
         open_in_system(CONFIG_PATH)
@@ -860,7 +913,7 @@ def run_tray(agent, cfg: dict) -> int:
         else:
             enable_autostart()
             _notify(icon, APP_TITLE, "已开启开机自启")
-        icon.update_menu()
+        _ui_call(_update_menu)
 
     def do_quit(icon, item):
         try:
@@ -878,6 +931,10 @@ def run_tray(agent, cfg: dict) -> int:
         MenuItem("自动探测本机输入口", do_autodetect),
         MenuItem("自动切换", toggle_auto, checked=lambda item: state["auto"]),
         MenuItem("参数设置 …", do_settings),
+        Menu.SEPARATOR,
+        MenuItem(line_pair, None, enabled=False),
+        MenuItem("配对两端 …", do_pair),
+        MenuItem("解除配对", do_unpair),
         Menu.SEPARATOR,
         MenuItem(
             lambda item: "快捷键 · %s：%s" % (HK_TITLE["to_me"], hk_label("to_me")),

@@ -14,8 +14,8 @@
 | 平台 | 文件 | 是什么 |
 | --- | --- | --- |
 | Windows | `display-kvm.exe` | **免安装执行文件**（绿色版）。双击直接运行，不用装、不用管理员权限，托盘常驻；配置生成在 `%APPDATA%\display-kvm\kvm.json`。适合先试一下，或者不想往系统里写东西。 |
-| Windows | `Display-KVM-Setup-1.0.6.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
-| macOS | `Display-KVM-1.0.6.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
+| Windows | `Display-KVM-Setup-1.0.7.exe` | **安装包**。双击安装，会写开始菜单快捷方式、可选桌面图标与开机自启，卸载入口也在开始菜单里。长期用推荐这个。 |
+| macOS | `Display-KVM-1.0.7.dmg` | **苹果 M 芯片（Apple Silicon：M1/M2/M3/M4）Mac 的安装包**。打开后把 `Display KVM` 拖进 Applications 即可。 |
 
 dmg 只面向 Apple 芯片的 Mac：它内置的 `m1ddc` 依赖 Apple 的私有 CoreDisplay 接口，
 **Intel Mac 上拿不到 DDC 通道**（需要把配置里的 DDC 命令换成 `ddcctl`）。
@@ -33,9 +33,13 @@ Windows 安装包做了什么：
 
 双端各装好后，必做三步：
 
-1. 两端 `token` 改成**完全一致**的随机串（Windows 端首次生成的是随机值，复制到 Mac 端即可）
+1. 让两端 `token` 一致——二选一：
+   - **懒人法（推荐）**：托盘菜单点「配对两端 …」，两端会自动在局域网里协商出同一个 `token` 并各自写盘，全程不用手动复制。
+   - **手工法**：两端 `token` 改成**完全一致**的随机串（Windows 端首次生成的是随机值，复制到 Mac 端即可）
 2. 改对两端的 `my_input_source` / `peer_input_source`（见下面第四节「找输入口」）
 3. 先保持 `dry_run: true` 跑几轮看日志，确认无误后改 `false`
+
+> 配对安全性：协商出的 `token` 在局域网里是**明文**广播的，家用无妨；公司 / 公共网络请勿用配对，改用手工法并自行保管随机串。已配对的两端会忽略任何新的配对请求，不会被同网段其他实例劫持。
 
 > 配置里带 `_readme` 字段，打开配置文件就有说明。
 
@@ -95,7 +99,7 @@ DDC 通道挂在活跃的视频链路上。显示器一旦切走，另一台机�
 
 ## 三、Windows 端安装（命令行方式）
 
-> 用了安装包（`Display-KVM-Setup-1.0.6.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
+> 用了安装包（`Display-KVM-Setup-1.0.7.exe`）或免安装版 `display-kvm.exe` 的话，**跳过这一节**，  
 > 直接看「⚡ 下载与安装」里的必做三步。以下是从源码跑的方式。
 
 不需要 `pip install` 任何东西。
@@ -181,7 +185,7 @@ schtasks /create /tn "display-kvm" ^
 
 ### 0. 从 Releases 拿 dmg（推荐）
 
-下载 `Display-KVM-1.0.6.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
+下载 `Display-KVM-1.0.7.dmg`，双击打开，把 `Display KVM` 拖进 Applications。
 首次打开若提示「无法验证开发者」，右键 → 打开，或执行：
 
 ```bash
@@ -199,7 +203,7 @@ bash packaging/build_mac.sh
 ```
 
 脚本会自动：建隔离虚拟环境 → 装 pyinstaller/pystray/pyobjc → 找或下载 m1ddc 并打包进 app →  
-构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.6.dmg`  
+构建 `Display KVM.app`（菜单栏应用，不占 Dock）→ ad-hoc 签名 → 产出 `Display-KVM-1.0.7.dmg`  
 （带拖拽到 Applications 的布局）。产物在 `dist/` 下。
 
 **前置条件：Python ≥ 3.10。** 脚本优先找 `/opt/homebrew/bin/python3`，找不到就回退 PATH 里的
@@ -428,3 +432,38 @@ Windows 上请在 Git Bash 里跑。
 - **打包成免 Python 环境的可执行文件**：PyInstaller 打一个 exe / .app，  
   部署时不用管 Python 解释器。
 - **托盘图标 / 菜单栏图标**：现在靠命令行，加个 UI 更好点。
+
+---
+
+## 十、更新日志
+
+### v1.0.7
+
+**新功能**
+
+1. **局域网自动配对**（不用再手动复制 `token`）  
+   菜单栏新增「配对两端 …」：一端发起，两端会在局域网里自动协商出同一个
+   `token` 并各自写回配置文件。另加了「解除配对」。  
+   注意：协商过程在局域网里是**明文广播**的，家用无妨，公司 / 公共网络请用手工法。
+   已配对的两端会忽略新的配对请求，不会被同网段其他实例劫持。
+
+**修复**
+
+2. **macOS 点「参数设置 → 保存」后程序直接退出**（崩溃，非主动退出）  
+   崩溃点：`AppHelper.callAfter` 回调里释放 PyObjC 对象时 `objc_release`
+   到一个已被 AppKit 释放的地址（`EXC_BAD_ACCESS / SIGSEGV`）。  
+   根因之一是 `NSWindow` 的 `releasedWhenClosed` **默认为 `YES`** —— 窗口一关闭
+   AppKit 就自己把它 release 掉，而 Python 侧还握着引用，必然二次释放。  
+   改法：显式 `setReleasedWhenClosed_(False)`，并且**设置窗口只创建一次、永久复用**
+   （关闭只是隐藏，再打开时刷新控件值后重新显示），**全程不做任何释放动作**——
+   没有释放，就不存在双重释放。顺带修掉了「点保存 / 取消后窗口不消失」。
+3. **macOS 菜单栏点完菜单项后图标失效 / 闪退**  
+   菜单追踪会话还在进行时就同步调用 `update_menu()`，会让旧的 `NSMenuItem`
+   被过度释放。改为把刷新推迟到菜单会话结束后的下一轮 run loop
+   （macOS 走 `AppHelper.callAfter`）。
+4. **Windows 参数设置界面打开是空白、保存 / 取消按钮乱码**  
+   中文 Windows 的 PowerShell 5.1 默认按 GBK 读无 BOM 的 UTF-8 脚本，导致整段中文
+   变乱码。改为脚本与临时 JSON 都写 `utf-8-sig`（带 BOM），读取时显式
+   `-Encoding utf8`。
+5. **参数设置保存后立即生效**（不用重启）  
+   保存后同步把改动推给主循环里 agent 持有的那份配置副本。

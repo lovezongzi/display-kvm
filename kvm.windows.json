@@ -5,6 +5,7 @@
 
   "peer_ip": "",
   "token": "改成一串只有你知道的随机字符",
+  "paired": false,
 
   "udp_port": 47821,
   "control_port": 47822,
