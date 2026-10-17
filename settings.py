@@ -372,11 +372,29 @@ def _form_mac(cfg: dict, on_save=None):
         def read_answers():
             # 必须在窗口关闭【之前】调用：close() 会把窗口连同子控件一起释放，
             # 之后再去读 c.state()/c.stringValue() 会访问已释放的 ObjC 对象。
-            # 这里直接转成 Python 原生值（str / bool），彻底脱离 ObjC 对象生命周期。
+            #
+            # 【重要】数值字段必须还原成 float/int，不能一律 str()。早期版本
+            # 统一 str() 写回，kvm.json 里于是出现 "3" / "0.45" 这类字符串，
+            # 主循环执行 `idle >= cfg["arm_after_idle_seconds"]` 时抛
+            #   TypeError: '>=' not supported between instances of 'float' and 'str'
+            # 异常被主循环 except 吞掉 —— 表现为**自动切换彻底失效**，且日志
+            # 每秒刷两行错误（实测 30 分钟 7000+ 行）。这里按字段类型写回。
             ans = {}
             for f in FIELDS:
                 c = controls[f.key]
-                ans[f.key] = bool(c.state()) if f.kind == "bool" else str(c.stringValue())
+                if f.kind == "bool":
+                    ans[f.key] = bool(c.state())
+                    continue
+                raw = str(c.stringValue()).strip()
+                old = cfg.get(f.key)
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    # 用户填了非数字：保留原值，绝不把脏数据写进配置
+                    ans[f.key] = old
+                    continue
+                # 原本是整数字段（如 tick_ms）就还写成整数，其余写成浮点
+                ans[f.key] = int(v) if isinstance(old, int) and not isinstance(old, bool) else v
             return ans
 
         def apply_values():
@@ -608,12 +626,33 @@ def _form_win(cfg: dict) -> dict | None:
     if not out or "__CANCEL__" in out:
         return None
 
+    # 按字段类型还原。PowerShell 一律输出字符串，若直接写回配置，
+    # 数值字段会变成 "3" 这种字符串，主循环拿它和 float 比较就抛
+    # TypeError -> 自动切换彻底失效 + 日志每秒刷屏（详见 read_answers 注释）。
+    kind_of = {f.key: f.kind for f in FIELDS}
+    old_of = {f.key: cfg.get(f.key) for f in FIELDS}
     answers = {}
     for line in out.splitlines():
         if "=" not in line:
             continue
         k, _, v = line.partition("=")
-        answers[k.strip()] = v.strip()
+        k = k.strip()
+        v = v.strip()
+        kind = kind_of.get(k)
+        if kind == "bool":
+            answers[k] = v.lower() in ("1", "true", "yes", "on")
+        elif kind == "float":
+            old = old_of.get(k)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                answers[k] = old  # 填了非数字：保留原值，不写脏数据
+            else:
+                answers[k] = (
+                    int(fv) if isinstance(old, int) and not isinstance(old, bool) else fv
+                )
+        else:
+            answers[k] = v
     return answers or None
 
 

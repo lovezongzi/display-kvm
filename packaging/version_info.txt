@@ -20,12 +20,12 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", "display-kvm"),
             StringStruct("FileDescription", "显示器输入源自动切换"),
-            StringStruct("FileVersion", "1.0.8"),
+            StringStruct("FileVersion", "1.0.9"),
             StringStruct("InternalName", "display-kvm"),
             StringStruct("LegalCopyright", "MIT License"),
             StringStruct("OriginalFilename", "display-kvm.exe"),
             StringStruct("ProductName", "display-kvm"),
-            StringStruct("ProductVersion", "1.0.8"),
+            StringStruct("ProductVersion", "1.0.9"),
           ],
         )
       ]

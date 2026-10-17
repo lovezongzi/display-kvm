@@ -92,6 +92,67 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+# 会被拿去做数值比较/运算的字段。v1.0.8 之前，设置窗口保存时把**所有**
+# 非布尔字段一律 str() 写回配置（"3"、"0.45"），于是这些值变成字符串；
+# 主循环每轮执行 `idle >= cfg["arm_after_idle_seconds"]` 时就会抛
+#   TypeError: '>=' not supported between instances of 'float' and 'str'
+# 被 _main_loop 的 except 吞掉后只留一行日志 —— 结果是**自动切换完全失效**，
+# 且日志每秒被刷两行（实测 30 分钟刷了 7000+ 行）。
+# 这里在加载配置时就统一归一化，让已被污染的配置文件自愈。
+FLOAT_KEYS = (
+    "role_poll_seconds",
+    "arm_after_idle_seconds",
+    "fire_below_idle_seconds",
+    "cooldown_seconds",
+    "hello_interval_seconds",
+    "peer_timeout_seconds",
+    "peer_settle_seconds",
+)
+INT_KEYS = (
+    "tick_ms",
+    "udp_port",
+    "peer_udp_port",
+    "control_port",
+    "display_index",
+    "match_width",
+    "match_height",
+)
+
+
+def _to_float(v, default: float) -> float:
+    """把配置值转成 float。转换失败（脏数据/空串）时退回默认值。"""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(v, default: int) -> int:
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_config(cfg: dict) -> dict:
+    """就地修复配置里的数值字段类型，返回同一 dict。"""
+    for k in FLOAT_KEYS:
+        if k in cfg and not isinstance(cfg[k], float):
+            cfg[k] = _to_float(cfg[k], float(DEFAULT_CONFIG.get(k, 0.0)))
+    for k in INT_KEYS:
+        if k in cfg and not isinstance(cfg[k], int):
+            cfg[k] = _to_int(cfg[k], int(DEFAULT_CONFIG.get(k, 0)))
+    return cfg
+
+
 def _src(v) -> int:
     if isinstance(v, int):
         return v
@@ -105,6 +166,8 @@ def log(msg: str) -> None:
 class Agent:
     def __init__(self, raw_cfg: dict, args: argparse.Namespace):
         cfg = {**DEFAULT_CONFIG, **raw_cfg}
+        # 修掉历史版本写坏的类型（数值被存成字符串），否则自动切换会持续抛错。
+        normalize_config(cfg)
         if args.dry_run:
             cfg["dry_run"] = True
         if args.port:
@@ -556,11 +619,13 @@ class Agent:
             return
 
         if not self.armed:
-            if idle >= self.cfg["arm_after_idle_seconds"]:
+            # 用 _to_float 兜底：万一配置被外部改成字符串/空值，这里不会抛
+            # TypeError 把整个自动切换拖死（历史上这里每秒报错刷屏）。
+            if idle >= _to_float(self.cfg.get("arm_after_idle_seconds"), 3.0):
                 self.armed = True
             return
 
-        if idle <= self.cfg["fire_below_idle_seconds"]:
+        if idle <= _to_float(self.cfg.get("fire_below_idle_seconds"), 0.45):
             self.armed = False
             self.request_switch("检测到本机键鼠活动")
 
